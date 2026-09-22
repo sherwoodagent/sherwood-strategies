@@ -25,8 +25,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *   BY ADDRESS. A per-launch clone would need a fresh whitelist entry from the
  *   venue owner for every fund — a manual, permissioned step in the middle of a
  *   governance execution, which is not a design so much as an outage. One
- *   certified singleton is whitelisted once and serves every fund. The custody
- *   argument for it is below.
+ *   singleton is whitelisted by Pons once, allowlisted in our `TierRegistry`
+ *   once, and serves every fund. The custody argument for it is below.
  *
  *   THE CRUX: `feeWallet` DOES DOUBLE DUTY, AND WE NEED TWO DESTINATIONS.
  *   Inside `launchToken` the single `params.feeWallet` field decides BOTH:
@@ -63,23 +63,27 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *   is `launched.deployer` for every launch it ever issues, FOREVER. The locker
  *   never lets that role be transferred or renounced. So the adapter
  *   permanently *could* re-point any of those fee streams — the venue would
- *   allow it. The invariant is satisfied not by giving the role away (Sushi's
- *   route, unavailable here) but by the adapter EXPOSING NO PATH TO USE IT:
- *   `setFeeRedirect` is called exactly once, from inside `launch`, with an
- *   argument the caller itself supplied, and there is no other caller-reachable
- *   route to the locker anywhere in this contract. `collectFees` calls
+ *   allow it. The invariant is satisfied not by giving the role away (the
+ *   route the Sushi Launchpad V1 adapter took, unavailable here) but by the
+ *   adapter EXPOSING NO PATH TO USE IT: `setFeeRedirect` is called exactly
+ *   once, from inside `launch`, with an argument the caller itself supplied,
+ *   and there is no other caller-reachable route to the locker anywhere in
+ *   this contract. `collectFees` calls
  *   `collectFees` and nothing else; there is no admin function, no owner, no
  *   arbitrary-call sink, no upgrade path, no `delegatecall`. A compromise of
- *   this contract is a compromise of its CODE, and its code is pinned by the
- *   `TierRegistry` codehash gate — which is the same assumption every other
- *   certified adapter in this repo already rests on. The narrower claim, and
- *   the one a test asserts: no external function of this adapter re-points a
- *   fee redirect after `launch` returns.
+ *   this contract is a compromise of its CODE, and that code cannot change
+ *   under a consuming strategy: the strategy admits this adapter only through
+ *   `TierRegistry.isCounterpartyAllowed`, which compares the live codehash
+ *   against the one snapshotted when the registry owner allowed it, and the
+ *   factory, locker and WETH addresses are immutables inside that codehash.
+ *   Every counterparty a v1 strategy binds rests on the same assumption. The
+ *   narrower claim, and the one a test asserts: no external function of this
+ *   adapter re-points a fee redirect after `launch` returns.
  *
- *   ZERO STORAGE, deliberately, for the same reason as the Sushi adapter:
- *   `launchRef` IS the token address and `getLaunchedToken(token).exists`
- *   already distinguishes an issued launch from an unknown one, so per-launch
- *   bookkeeping here could only ever DISAGREE with the venue. Every verb
+ *   ZERO STORAGE, deliberately: `launchRef` IS the token address and
+ *   `getLaunchedToken(token).exists` already distinguishes an issued launch
+ *   from an unknown one, so per-launch bookkeeping here could only ever
+ *   DISAGREE with the venue. Every verb
  *   re-derives from venue state.
  *
  *   REENTRANCY. No guard, and none is needed: the adapter holds no balance and
@@ -87,7 +91,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *   contracts are `ReentrancyGuard`ed upstream. A re-entrant callback would
  *   find an empty contract.
  *
- *   HOW THIS DIFFERS FROM `SushiLaunchAdapter`, in the three places it matters:
+ *   HOW THIS DIFFERS FROM A SUSHI LAUNCH, in the three places it matters:
  *     - BOTH the fee and the buy are funded in NATIVE here
  *       (`initialBuyAmount = msg.value - launchFee`), so the adapter pulls
  *       `p.quoteIn + launchFee()` of WETH and unwraps the lot. On Sushi only
@@ -114,11 +118,12 @@ contract PonsLaunchAdapter is ILaunchAdapter {
     ///      There is exactly one launch config and one dex config on 4663
     ///      today, so pinning `(0, 0)` would work — right up until Pons adds a
     ///      second pairing, at which point a pinned adapter would have to be
-    ///      redeployed and RE-CERTIFIED to reach it, and the new pairing would
-    ///      read to an agent as "the venue does not support this" rather than
-    ///      "our adapter was frozen at one config". Naming the ids in the
-    ///      proposal puts the choice where the vote can see it and lets the
-    ///      venue grow without touching certified code. Every field is
+    ///      redeployed, RE-ALLOWLISTED and re-whitelisted by Pons to reach it,
+    ///      and the new pairing would read to an agent as "the venue does not
+    ///      support this" rather than "our adapter was frozen at one config".
+    ///      Naming the ids in the proposal puts the choice where the vote can
+    ///      see it and lets the venue grow without touching allowlisted code.
+    ///      Every field is
     ///      validated in `launch` before any capital moves — see
     ///      `_validateVenue`.
     ///
@@ -349,7 +354,7 @@ contract PonsLaunchAdapter is ILaunchAdapter {
     ///      value the caller attached is theirs. The TOKEN sweeps assert their
     ///      postcondition; the NATIVE sweep is best-effort and never reverts
     ///      the launch. That asymmetry is deliberate: native can be force-sent
-    ///      to this address by anyone for one wei, and a shared certified
+    ///      to this address by anyone for one wei, and a shared allowlisted
     ///      singleton that stops serving every fund because someone gave it a
     ///      wei has the wrong invariant. See `_sweepNative`.
     ///
@@ -551,7 +556,7 @@ contract PonsLaunchAdapter is ILaunchAdapter {
     ///           allowlist of ours — it is the venue's own gate, read live, so
     ///           the answer changes the moment the Pons owner adds, enables or
     ///           disables a config, with no change, redeploy or
-    ///           re-certification here. WETH is the only pairing configured
+    ///           re-allowlisting here. WETH is the only pairing configured
     ///           today (`launchConfigCount() == 1`), so WETH is the only true
     ///           answer today. USDG, WOOD or a stock token would become true by
     ///           a Pons configuration change alone.
@@ -816,12 +821,13 @@ contract PonsLaunchAdapter is ILaunchAdapter {
     ///
     ///      Reverting on a failed send would hand that force-send the power to
     ///      disable `launch` FOR EVERY FUND, permanently, for one wei: the
-    ///      caller is a `BaseStrategy` clone, no strategy declares `receive` or
-    ///      `fallback`, so the send to it can never succeed, and this is the
-    ///      only path that moves native off this contract — recovery would mean
-    ///      a new implementation plus re-certification, and on this venue also
-    ///      a fresh whitelist entry from Pons. The invariant a SHARED,
-    ///      CERTIFIED singleton has to hold is that it keeps working, and that
+    ///      caller is a `BaseStrategy` clone, `BaseStrategy` declares no
+    ///      `receive` or `fallback` and `LaunchpadStrategy` adds neither, so the
+    ///      send to it can never succeed, and this is the only path that moves
+    ///      native off this contract — recovery would mean a new deployment, a
+    ///      fresh `setCounterpartyAllowed` grant, and on this venue also a fresh
+    ///      whitelist entry from Pons. The invariant a SHARED, ALLOWLISTED
+    ///      singleton has to hold is that it keeps working, and that
     ///      strictly dominates "it always returns dust". Leaving the balance
     ///      takes nothing from anyone with a claim on it, and the next caller
     ///      whose send DOES succeed sweeps it.

@@ -668,7 +668,7 @@ contract PonsLaunchAdapterTest is Test {
 
     /// @dev ONE FORCE-SENT WEI MUST NOT BRICK THE SINGLETON. The caller is a
     ///      contract that cannot accept a send, and this sweep is the only path
-    ///      moving native off a shared, certified adapter — one that on this
+    ///      moving native off a shared, allowlisted adapter — one that on this
     ///      venue would also need a fresh Pons whitelist entry to replace.
     function test_Launch_SurvivesNativeForceSentToTheAdapter() public {
         new ForceSender{value: 1}(payable(address(adapter)));

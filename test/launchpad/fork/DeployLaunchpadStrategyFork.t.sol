@@ -8,6 +8,7 @@ import {StrategyFactory} from "@sherwood/StrategyFactory.sol";
 
 import {DeployLaunchpadStrategy} from "../../../script/launchpad/DeployLaunchpadStrategy.s.sol";
 import {LaunchpadStrategy} from "../../../src/launchpad/LaunchpadStrategy.sol";
+import {SushiLaunchAdapter} from "../../../src/launchpad/adapters/SushiLaunchAdapter.sol";
 import {StonkLaunchAdapter} from "../../../src/launchpad/adapters/StonkLaunchAdapter.sol";
 import {IStonkSafeLaunchpadV2} from "../../../src/launchpad/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol";
 import {MockSwapAdapter} from "../../mocks/MockSwapAdapter.sol";
@@ -121,6 +122,17 @@ contract DeployLaunchpadStrategyForkTest is Test {
         assertTrue(stonk.code.length != 0, "StonkLaunchAdapter deployed");
         assertTrue(template.code.length != 0, "LaunchpadStrategy template deployed");
         assertEq(StonkLaunchAdapter(stonk).implementation(), stonk, "the deployed Stonk adapter IS the implementation");
+        address sushi = address(script.sushiAdapter());
+        assertEq(
+            SushiLaunchAdapter(payable(sushi)).implementation(),
+            sushi,
+            "the deployed Sushi adapter IS the implementation"
+        );
+        assertEq(
+            address(SushiLaunchAdapter(payable(sushi)).launchpad()),
+            _bookAddress("SUSHI_LAUNCHPAD_V2"),
+            "Sushi adapter fronts the V2 launchpad"
+        );
 
         // ── the Robinhood code-size limit ──
         uint256 size = template.code.length;
@@ -168,6 +180,8 @@ contract DeployLaunchpadStrategyForkTest is Test {
             assertTrue(registry.isCounterpartyAllowed(pads[i]), "pad granted");
         }
         assertTrue(registry.isCounterpartyAllowed(_bookAddress("SAFE_LAUNCH_LENS_V2")), "lens granted");
+        assertTrue(registry.isCounterpartyAllowed(address(script.sushiAdapter())), "Sushi adapter granted");
+        assertTrue(registry.isCounterpartyAllowed(_bookAddress("SUSHI_LAUNCHPAD_V2")), "Sushi launchpad granted");
         assertTrue(factory.approvedTemplate(template), "template approved");
 
         // The template binds: a WETH-quoted clone initializes against the
@@ -195,6 +209,7 @@ contract DeployLaunchpadStrategyForkTest is Test {
         script.deploy(address(registry), address(factory));
 
         assertFalse(registry.isCounterpartyAllowed(address(script.stonkAdapter())), "no grant without ownership");
+        assertFalse(registry.isCounterpartyAllowed(address(script.sushiAdapter())), "no Sushi grant without ownership");
         assertFalse(factory.approvedTemplate(address(script.template())), "no approval without ownership");
     }
 

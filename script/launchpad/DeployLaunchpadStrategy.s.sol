@@ -7,11 +7,19 @@ import {StrategyFactory} from "@sherwood/StrategyFactory.sol";
 import {LaunchpadStrategy} from "../../src/launchpad/LaunchpadStrategy.sol";
 import {StonkLaunchAdapter} from "../../src/launchpad/adapters/StonkLaunchAdapter.sol";
 import {IStonkSafeLaunchpadV2} from "../../src/launchpad/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol";
+import {SushiLaunchAdapter} from "../../src/launchpad/adapters/SushiLaunchAdapter.sol";
+import {ISushiLaunchpadV2} from "../../src/launchpad/vendor/sushi/ISushiLaunchpadV2.sol";
+
+/// @dev The one position-manager read the Sushi identity round trip needs.
+interface IPositionManagerFactory {
+    function factory() external view returns (address);
+}
 
 /**
- * @notice Deploy the LaunchpadStrategy template and the StonkBrokers launch
- *         adapter to Robinhood Chain mainnet (chain 4663), and bring them to
- *         the state protocol v1 needs before any vault can use them.
+ * @notice Deploy the LaunchpadStrategy template, the StonkBrokers launch
+ *         adapter and the Sushi Launchpad V2 launch adapter to Robinhood Chain
+ *         mainnet (chain 4663), and bring them to the state protocol v1 needs
+ *         before any vault can use them.
  *
  *   MAINNET-ONLY BY CONSTRUCTION. The venues exist on 4663 and nowhere else,
  *   so the script refuses any other chain rather than deploying a template
@@ -20,13 +28,15 @@ import {IStonkSafeLaunchpadV2} from "../../src/launchpad/vendor/stonkbrokers/ISt
  *   `test/launchpad/fork/DeployLaunchpadStrategyFork.t.sol`).
  *
  *   WHAT v1 NEEDS, and why each step is not optional:
- *     1. `TierRegistry.setCounterpartyAllowed(stonkAdapter, true)`.
+ *     1. `TierRegistry.setCounterpartyAllowed(adapter, true)` for the Stonk
+ *        AND the Sushi adapter.
  *        `LaunchpadStrategy._initialize` binds its launch adapter through
  *        `isCounterpartyAllowed`, so an un-granted adapter makes the template
  *        INERT, and the failure surfaces a governance cycle later, at
  *        clone-init. The grant snapshots the adapter's codehash, so it must
  *        follow the deploy (this script orders it so).
- *     2. `setCounterpartyAllowed` for each of the eight V2 pads and the lens.
+ *     2. `setCounterpartyAllowed` for each of the eight V2 pads, the lens and
+ *        the Sushi Launchpad V2 proxy.
  *        No code path reads these today: the adapter pins its pads in
  *        constructor-written storage covered by `padSetHash`, and never calls
  *        the lens on-chain. They are granted anyway because `ILaunchAdapter`
@@ -53,6 +63,15 @@ import {IStonkSafeLaunchpadV2} from "../../src/launchpad/vendor/stonkbrokers/ISt
  *   protocol does not carry (the Stonk pads and lens) live in
  *   `script/launchpad/addresses-4663.json`, with their identity evidence.
  *
+ *   SUSHI IDENTITY. Before deploying the Sushi adapter the script asserts the
+ *   launchpad is a V2 implementation and that its `v3Factory()` and
+ *   `positionManager()` are the book's Sushi V3 pair AND that the position
+ *   manager's own `factory()` names that factory. A code-length check passes
+ *   on a squatted address; a graph a squatter would have to reproduce whole
+ *   does not. The proxy is UUPS: record the printed implementation slot with
+ *   the grant, because the codehash snapshot pins the PROXY's code, not the
+ *   implementation behind it.
+ *
  *   Record the printed `padSetHash` with the grant: the codehash snapshot pins
  *   the Stonk adapter's CODE, and that hash is the only on-chain witness of the
  *   lane CONFIGURATION the code was granted with.
@@ -65,11 +84,16 @@ contract DeployLaunchpadStrategy is Script {
     /// @dev Robinhood Chain MaxCodeSize is 98,304 bytes (4x EIP-170).
     uint256 internal constant ROBINHOOD_MAX_CODE_SIZE = 98_304;
 
+    /// @dev `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`.
+    bytes32 internal constant _ERC1967_IMPLEMENTATION_SLOT =
+        0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
     string internal constant PROTOCOL_BOOK = "/lib/sherwood-protocol/chains/4663.json";
     string internal constant LAUNCHPAD_BOOK = "/script/launchpad/addresses-4663.json";
 
     /// @notice What the last `deploy` produced, for the fork rehearsal to read.
     StonkLaunchAdapter public stonkAdapter;
+    SushiLaunchAdapter public sushiAdapter;
     LaunchpadStrategy public template;
 
     function run() external {
@@ -89,6 +113,7 @@ contract DeployLaunchpadStrategy is Script {
     function deploy(address registry, address factory) public {
         (address[] memory quotes, address[] memory pads) = _stonkLaneSet();
         address lens = _launchpadAddress("SAFE_LAUNCH_LENS_V2");
+        address sushiLaunchpad = _sushiLaunchpad();
 
         vm.startBroadcast();
         (, address deployer,) = vm.readCallers();
@@ -98,11 +123,10 @@ contract DeployLaunchpadStrategy is Script {
         stonkAdapter = new StonkLaunchAdapter(quotes, pads, lens);
         template = new LaunchpadStrategy();
 
-        // SUSHI V2: added on the sushi-v2 branch. Deploy the Sushi Launchpad V2
-        // adapter here, after the Stonk adapter and before the grants below, and
-        // append it and the venue contract(s) it calls to `counterparties`.
+        sushiAdapter = new SushiLaunchAdapter(sushiLaunchpad);
 
-        address[] memory counterparties = _counterparties(address(stonkAdapter), pads, lens);
+        address[] memory counterparties =
+            _counterparties(address(stonkAdapter), pads, lens, address(sushiAdapter), sushiLaunchpad);
 
         bool ownsRegistry = registry != address(0) && TierRegistry(registry).owner() == deployer;
         if (ownsRegistry) {
@@ -126,6 +150,9 @@ contract DeployLaunchpadStrategy is Script {
 
         console.log("StonkLaunchAdapter:   ", address(stonkAdapter));
         console.log("LaunchpadStrategy:    ", address(template));
+        console.log("SushiLaunchAdapter:   ", address(sushiAdapter));
+        console.log("Sushi Launchpad V2 implementation (record with the grant):");
+        console.logBytes32(vm.load(sushiLaunchpad, _ERC1967_IMPLEMENTATION_SLOT));
         console.log("StonkLaunchAdapter padSetHash:");
         console.logBytes32(stonkAdapter.padSetHash());
 
@@ -133,18 +160,39 @@ contract DeployLaunchpadStrategy is Script {
         _printValidation(registry, factory, counterparties);
     }
 
-    /// @dev Every address this ceremony vouches for, adapter first.
-    function _counterparties(address adapter, address[] memory pads, address lens)
+    /// @dev Every address this ceremony vouches for, adapters first.
+    function _counterparties(address stonk, address[] memory pads, address lens, address sushi, address sushiLaunchpad)
         internal
         pure
         returns (address[] memory list)
     {
-        list = new address[](pads.length + 2);
-        list[0] = adapter;
+        list = new address[](pads.length + 4);
+        list[0] = stonk;
+        list[1] = sushi;
         for (uint256 i; i < pads.length; ++i) {
-            list[i + 1] = pads[i];
+            list[i + 2] = pads[i];
         }
-        list[pads.length + 1] = lens;
+        list[pads.length + 2] = lens;
+        list[pads.length + 3] = sushiLaunchpad;
+    }
+
+    /// @dev The Sushi Launchpad V2 proxy from the book, asserted by IDENTITY
+    ///      before anything is deployed against it. See the contract header.
+    function _sushiLaunchpad() internal view returns (address launchpad) {
+        launchpad = _launchpadAddress("SUSHI_LAUNCHPAD_V2");
+        address factory = _launchpadAddress("SUSHI_V3_FACTORY");
+        address positionManager = _launchpadAddress("SUSHI_V3_POSITION_MANAGER");
+        ISushiLaunchpadV2 lp = ISushiLaunchpadV2(launchpad);
+        require(lp.implementationVersion() == 2, "Sushi launchpad is not a V2 implementation");
+        require(lp.v3Factory() == factory, "Sushi launchpad v3Factory() is not the book's Sushi V3 factory");
+        require(
+            lp.positionManager() == positionManager,
+            "Sushi launchpad positionManager() is not the book's Sushi V3 position manager"
+        );
+        require(
+            IPositionManagerFactory(positionManager).factory() == factory,
+            "Sushi V3 position manager does not name the Sushi V3 factory"
+        );
     }
 
     /// @dev The eight V2 (mint-launch) lanes, read from the launchpad book.

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {console, Script} from "forge-std/Script.sol";
+import {console} from "forge-std/Script.sol";
+import {DeploymentsBook} from "../DeploymentsBook.sol";
 import {TierRegistry} from "@sherwood/TierRegistry.sol";
 import {StrategyFactory} from "@sherwood/StrategyFactory.sol";
 import {LaunchpadStrategy} from "../../src/launchpad/LaunchpadStrategy.sol";
@@ -56,12 +57,21 @@ interface IPositionManagerFactory {
  *   post-deploy reads at the end say what is actually true on-chain.
  *
  *   ADDRESSES. Protocol-owned keys (`TIER_REGISTRY`, `STRATEGY_FACTORY`,
- *   `UNISWAP_SWAP_ADAPTER`) are read from the protocol's own book,
- *   `lib/sherwood-protocol/chains/4663.json`, and may be overridden by an env
- *   var of the same name (the v1 book at the current pin predates the 4663
- *   core deploy, so they are absent there until it lands). Venue keys the
- *   protocol does not carry (the Stonk pads and lens) live in
- *   `script/launchpad/addresses-4663.json`, with their identity evidence.
+ *   `UNISWAP_SWAP_ADAPTER`) are read from the protocol's own book for THIS
+ *   chain, `lib/sherwood-protocol/chains/<chainid>.json`, and may be
+ *   overridden by an env var of the same name (the v1 book at the current pin
+ *   predates the 4663 core deploy, so on mainnet they are absent until it
+ *   lands; on the 9994663 fork the pinned book already names the live stack).
+ *   Venue keys the protocol does not carry (the Stonk pads, the lens, Sushi)
+ *   live in `script/launchpad/addresses-4663.json`, with their identity
+ *   evidence; the fork replays mainnet's venues, so it reads the same file.
+ *
+ *   RECORDING. On a real broadcast the deployed addresses are written to this
+ *   repo's book, `deployments/<chainid>.json`, as `LAUNCHPAD_TEMPLATE`,
+ *   `SUSHI_LAUNCH_ADAPTER` and `STONK_LAUNCH_ADAPTER`, with the `padSetHash`
+ *   and the Sushi implementation slot under `_meta.launchpad` (see
+ *   `DeploymentsBook`). `--sig 'verify()'` re-reads them and checks the whole
+ *   deployment against the chain without redeploying.
  *
  *   SUSHI IDENTITY. Before deploying the Sushi adapter the script asserts the
  *   launchpad is V2.2 (`implementationVersion() == 2`, `implementationRevision()
@@ -80,11 +90,17 @@ interface IPositionManagerFactory {
  *   the Stonk adapter's CODE, and that hash is the only on-chain witness of the
  *   lane CONFIGURATION the code was granted with.
  *
- *   Usage:
+ *   Usage — Tenderly Robinhood fork (9994663):
+ *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
+ *       --rpc-url "$TENDERLY_ROBINHOOD_RPC_URL" --account sherwood-deployer --broadcast --slow
+ *   Usage — Robinhood mainnet (4663):
  *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
  *       --rpc-url robinhood --account sherwood-deployer --broadcast
+ *   Verify either afterwards:
+ *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
+ *       --rpc-url <same> --sig 'verify()'
  */
-contract DeployLaunchpadStrategy is Script {
+contract DeployLaunchpadStrategy is DeploymentsBook {
     /// @dev Robinhood Chain MaxCodeSize is 98,304 bytes (4x EIP-170).
     uint256 internal constant ROBINHOOD_MAX_CODE_SIZE = 98_304;
 
@@ -92,7 +108,6 @@ contract DeployLaunchpadStrategy is Script {
     bytes32 internal constant _ERC1967_IMPLEMENTATION_SLOT =
         0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
 
-    string internal constant PROTOCOL_BOOK = "/lib/sherwood-protocol/chains/4663.json";
     string internal constant LAUNCHPAD_BOOK = "/script/launchpad/addresses-4663.json";
 
     /// @notice What the last `deploy` produced, for the fork rehearsal to read.
@@ -101,12 +116,61 @@ contract DeployLaunchpadStrategy is Script {
     LaunchpadStrategy public template;
 
     function run() external {
-        uint256 forkChainId = vm.envOr("ROBINHOOD_FORK_CHAIN_ID", uint256(0));
-        require(
-            block.chainid == 4663 || (forkChainId != 0 && block.chainid == forkChainId),
-            "wrong chain: expected Robinhood mainnet 4663 or ROBINHOOD_FORK_CHAIN_ID"
-        );
+        require(_isRobinhood(), "wrong chain: expected Robinhood mainnet 4663 or its 9994663 fork");
         deploy(_protocolAddress("TIER_REGISTRY"), _protocolAddress("STRATEGY_FACTORY"));
+    }
+
+    /// @notice Check a recorded deployment against the chain, without
+    ///         deploying: `--sig 'verify()'`.
+    function verify() external view {
+        require(_isRobinhood(), "wrong chain: expected Robinhood mainnet 4663 or its 9994663 fork");
+        verifyDeployment(
+            _requireProtocolAddress("TIER_REGISTRY"),
+            _requireProtocolAddress("STRATEGY_FACTORY"),
+            _requireDeployedAddress("LAUNCHPAD_TEMPLATE"),
+            _requireDeployedAddress("STONK_LAUNCH_ADAPTER"),
+            _requireDeployedAddress("SUSHI_LAUNCH_ADAPTER")
+        );
+    }
+
+    /// @notice Every property a correct deployment has, asserted. Owner steps
+    ///         are checked as FACTS: a deployment still owed Safe transactions
+    ///         fails verification until they land.
+    function verifyDeployment(address registry, address factory, address template_, address stonk, address sushi)
+        public
+        view
+    {
+        require(template_.code.length != 0, "LAUNCHPAD_TEMPLATE holds no code");
+        require(LaunchpadStrategy(template_).vault() == address(0), "LAUNCHPAD_TEMPLATE is a clone, not the template");
+        require(stonk.code.length != 0, "STONK_LAUNCH_ADAPTER holds no code");
+        require(StonkLaunchAdapter(stonk).implementation() == stonk, "STONK_LAUNCH_ADAPTER is not an implementation");
+        require(sushi.code.length != 0, "SUSHI_LAUNCH_ADAPTER holds no code");
+        require(
+            SushiLaunchAdapter(payable(sushi)).implementation() == sushi,
+            "SUSHI_LAUNCH_ADAPTER is not an implementation"
+        );
+
+        (address[] memory quotes, address[] memory pads) = _stonkLaneSet();
+        require(
+            StonkLaunchAdapter(stonk).padSetHash() == keccak256(abi.encode(quotes, pads)),
+            "STONK_LAUNCH_ADAPTER padSetHash does not match the book's eight V2 lanes"
+        );
+        address sushiLaunchpad = _sushiLaunchpad();
+        require(
+            address(SushiLaunchAdapter(payable(sushi)).launchpad()) == sushiLaunchpad,
+            "SUSHI_LAUNCH_ADAPTER does not front the book's Sushi Launchpad V2"
+        );
+
+        require(TierRegistry(registry).strategyFactory() == factory, "TIER_REGISTRY does not point at STRATEGY_FACTORY");
+        require(StrategyFactory(factory).approvedTemplate(template_), "template not approved on StrategyFactory");
+        address[] memory counterparties =
+            _counterparties(stonk, pads, _launchpadAddress("SAFE_LAUNCH_LENS_V2"), sushi, sushiLaunchpad);
+        for (uint256 i; i < counterparties.length; ++i) {
+            require(TierRegistry(registry).isCounterpartyAllowed(counterparties[i]), "a counterparty is not allowed");
+        }
+        console.log("verified: LAUNCHPAD_TEMPLATE", template_);
+        console.log("verified: STONK_LAUNCH_ADAPTER", stonk);
+        console.log("verified: SUSHI_LAUNCH_ADAPTER", sushi);
     }
 
     /// @notice The ceremony, with the two protocol singletons passed in.
@@ -122,7 +186,7 @@ contract DeployLaunchpadStrategy is Script {
         vm.startBroadcast();
         (, address deployer,) = vm.readCallers();
         console.log("Deployer:", deployer);
-        console.log("Network: Robinhood Chain (chain ID 4663)");
+        console.log("Chain ID:", block.chainid);
 
         stonkAdapter = new StonkLaunchAdapter(quotes, pads, lens);
         template = new LaunchpadStrategy();
@@ -162,6 +226,19 @@ contract DeployLaunchpadStrategy is Script {
 
         _printRunbook(registry, factory, counterparties, ownsRegistry, ownsFactory);
         _printValidation(registry, factory, counterparties);
+
+        _recordAddress("LAUNCHPAD_TEMPLATE", address(template));
+        _recordAddress("STONK_LAUNCH_ADAPTER", address(stonkAdapter));
+        _recordAddress("SUSHI_LAUNCH_ADAPTER", address(sushiAdapter));
+        vm.serializeUint("launchpad", "block", block.number);
+        vm.serializeAddress("launchpad", "deployer", deployer);
+        vm.serializeAddress("launchpad", "strategyFactory", factory);
+        vm.serializeAddress("launchpad", "tierRegistry", registry);
+        vm.serializeBytes32("launchpad", "stonkPadSetHash", stonkAdapter.padSetHash());
+        vm.serializeBytes32(
+            "launchpad", "sushiLaunchpadImplementation", vm.load(sushiLaunchpad, _ERC1967_IMPLEMENTATION_SLOT)
+        );
+        _recordMeta("launchpad", vm.serializeBool("launchpad", "ownerStepsComplete", ownsRegistry && ownsFactory));
     }
 
     /// @dev Every address this ceremony vouches for, adapters first.
@@ -330,15 +407,6 @@ contract DeployLaunchpadStrategy is Script {
 
     // ── address books ──
 
-    /// @dev A protocol-owned key: env override first, then the protocol's own
-    ///      book. `address(0)` when neither has it — the caller decides whether
-    ///      that is fatal.
-    function _protocolAddress(string memory key) internal view returns (address) {
-        address fromEnv = vm.envOr(key, address(0));
-        if (fromEnv != address(0)) return fromEnv;
-        return _optionalFrom(string.concat(vm.projectRoot(), PROTOCOL_BOOK), key);
-    }
-
     /// @dev A venue key from this repo's launchpad book. Mandatory.
     function _launchpadAddress(string memory key) internal view returns (address a) {
         a = _optionalLaunchpadAddress(key);
@@ -347,17 +415,5 @@ contract DeployLaunchpadStrategy is Script {
 
     function _optionalLaunchpadAddress(string memory key) internal view returns (address) {
         return _optionalFrom(string.concat(vm.projectRoot(), LAUNCHPAD_BOOK), key);
-    }
-
-    function _optionalFrom(string memory path, string memory key) internal view returns (address) {
-        string memory json;
-        try vm.readFile(path) returns (string memory contents) {
-            json = contents;
-        } catch {
-            return address(0);
-        }
-        string memory jsonKey = string.concat(".", key);
-        if (!vm.keyExistsJson(json, jsonKey)) return address(0);
-        return vm.parseJsonAddress(json, jsonKey);
     }
 }

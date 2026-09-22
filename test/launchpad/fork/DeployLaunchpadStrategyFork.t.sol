@@ -196,6 +196,47 @@ contract DeployLaunchpadStrategyForkTest is Test {
         assertEq(address(clone.launchAdapter()), stonk, "bound to the granted adapter");
     }
 
+    /// @notice `verifyDeployment` accepts exactly what a complete owned ceremony
+    ///         produced, and a run inside `forge test` records nothing in the
+    ///         deployments book (writes happen on a real broadcast only).
+    function test_verify_acceptsACompleteDeploymentAndTestsWriteNoBook() public {
+        _skipIfNoFork();
+
+        (TierRegistry registry, StrategyFactory factory) = _ownedSingletons(_broadcaster());
+        vm.prank(_broadcaster());
+        registry.setStrategyFactory(address(factory));
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        script.deploy(address(registry), address(factory));
+
+        script.verifyDeployment(
+            address(registry),
+            address(factory),
+            address(script.template()),
+            address(script.stonkAdapter()),
+            address(script.sushiAdapter())
+        );
+        assertFalse(vm.exists(script.deploymentsPath(block.chainid)), "a test run wrote the deployments book");
+    }
+
+    /// @notice A deployment still owed its Safe transactions fails verification.
+    function test_verify_refusesADeploymentStillOwedOwnerSteps() public {
+        _skipIfNoFork();
+
+        (TierRegistry registry, StrategyFactory factory) = _ownedSingletons(makeAddr("ownerSafe"));
+        vm.prank(makeAddr("ownerSafe"));
+        registry.setStrategyFactory(address(factory));
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        script.deploy(address(registry), address(factory));
+
+        // Read the addresses first: `expectRevert` applies to the very next
+        // call, and the getters would otherwise consume it.
+        address template = address(script.template());
+        address stonk = address(script.stonkAdapter());
+        address sushi = address(script.sushiAdapter());
+        vm.expectRevert(bytes("template not approved on StrategyFactory"));
+        script.verifyDeployment(address(registry), address(factory), template, stonk, sushi);
+    }
+
     /// @notice A broadcaster that does NOT own the registry or the factory
     ///         (mainnet, once the Safe has accepted ownership) writes nothing:
     ///         the steps are printed as Safe transactions, and the template
@@ -311,15 +352,10 @@ contract DeployLaunchpadStrategyForkTest is Test {
     ///         else, before it reads a book or deploys anything.
     function test_run_rejectsAWrongChainId() public {
         _skipIfNoFork();
-
-        // Pick an id that is neither 4663 nor whatever the fork escape hatch
-        // names, so the GUARD is under test rather than the environment.
-        uint256 escape = vm.envOr("ROBINHOOD_FORK_CHAIN_ID", uint256(0));
-        uint256 wrong = escape == 1 ? 2 : 1;
-        vm.chainId(wrong);
+        vm.chainId(1);
 
         DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
-        vm.expectRevert(bytes("wrong chain: expected Robinhood mainnet 4663 or ROBINHOOD_FORK_CHAIN_ID"));
+        vm.expectRevert(bytes("wrong chain: expected Robinhood mainnet 4663 or its 9994663 fork"));
         script.run();
     }
 

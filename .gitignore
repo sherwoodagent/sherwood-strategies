@@ -2,3 +2,5 @@ out/
 cache/
 broadcast/*/31337/
 .env
+deployments/.test-*
+broadcast/**/dry-run/

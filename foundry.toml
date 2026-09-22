@@ -15,6 +15,7 @@ fs_permissions = [
     { access = "read", path = "lib/sherwood-protocol/chains" },
     { access = "read", path = "script/launchpad" },
     { access = "read", path = "script/lighter" },
+    { access = "read-write", path = "deployments" },
 ]
 
 [profile.default.fmt]

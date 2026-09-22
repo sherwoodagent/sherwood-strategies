@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Script, console} from "forge-std/Script.sol";
+import {console} from "forge-std/Script.sol";
+import {DeploymentsBook} from "../DeploymentsBook.sol";
 import {StrategyFactory} from "@sherwood/StrategyFactory.sol";
 import {TierRegistry} from "@sherwood/TierRegistry.sol";
 import {IStrategy} from "@sherwood/interfaces/IStrategy.sol";
@@ -66,8 +67,16 @@ import {LighterPerpStrategy} from "../../src/lighter/LighterPerpStrategy.sol";
  *   (`lib/sherwood-protocol/chains/{chainId}.json`) — the env wins because the
  *   submodule pin can lag a deployment. The venue constants come from
  *   `script/lighter/addresses-4663.json` and are checked against the live
- *   venue by IDENTITY, not code presence. The deployed template address is
- *   printed, not written back: this repo does not edit the protocol's book.
+ *   venue by IDENTITY, not code presence. The deployed template is recorded as
+ *   `LIGHTER_PERP_TEMPLATE` in THIS repo's book, `deployments/<chainid>.json`,
+ *   on a real broadcast only (see `DeploymentsBook`); this repo never edits the
+ *   protocol's book. `--sig 'verify()'` re-reads that entry and checks the
+ *   deployment against the chain without redeploying.
+ *
+ *   WHERE IT RUNS. Robinhood mainnet only, by decision (2026-09-22): the 9994663
+ *   fork has the ZkLighter contract but no sequencer, so withdrawals never
+ *   mature there and nothing past execute could be exercised. The template's
+ *   constructor still accepts the fork for tests and rehearsals.
  *
  *   Usage — Robinhood mainnet (4663):
  *     forge script script/lighter/DeployLighterTemplate.s.sol:DeployLighterTemplate \
@@ -83,17 +92,11 @@ import {LighterPerpStrategy} from "../../src/lighter/LighterPerpStrategy.sol";
  *   Observed on vnet a3fb16 on 2026-08-22: `setTemplateApproval` approved the
  *   SIMULATED template address, which holds no code.
  */
-contract DeployLighterTemplate is Script {
+contract DeployLighterTemplate is DeploymentsBook {
     /// @dev Robinhood Chain MaxCodeSize is 98,304 bytes (4x EIP-170). Asserted
     ///      rather than assumed: a template over the limit deploys to a codeless
     ///      address on some clients and reverts on others.
     uint256 internal constant ROBINHOOD_MAX_CODE_SIZE = 98_304;
-
-    /// @dev The same two chains `LighterPerpStrategy`'s constructor accepts.
-    ///      46630 (robinhood-testnet) is absent on purpose: Lighter is not
-    ///      deployed there.
-    uint256 internal constant CHAIN_ROBINHOOD = 4663;
-    uint256 internal constant CHAIN_ROBINHOOD_FORK = 9994663;
 
     string internal constant VENUE_BOOK = "script/lighter/addresses-4663.json";
 
@@ -115,8 +118,8 @@ contract DeployLighterTemplate is Script {
         Venue memory v = venue();
         assertVenue(v);
 
-        address factory = _protocolAddress("STRATEGY_FACTORY");
-        address registry = _protocolAddress("TIER_REGISTRY");
+        address factory = _requireProtocolAddress("STRATEGY_FACTORY");
+        address registry = _requireProtocolAddress("TIER_REGISTRY");
 
         vm.startBroadcast();
         (address template, bool complete) = ceremony(factory, registry, v.zkLighter, msg.sender);
@@ -125,8 +128,44 @@ contract DeployLighterTemplate is Script {
         uint256 size = template.code.length;
         console.log("Template runtime size:", size);
         require(size <= ROBINHOOD_MAX_CODE_SIZE, "template exceeds Robinhood MaxCodeSize");
-        console.log("LighterPerpStrategy template (record as LIGHTER_PERP_TEMPLATE):", template);
+        console.log("LighterPerpStrategy template (LIGHTER_PERP_TEMPLATE):", template);
         if (!complete) console.log("INCOMPLETE: the RUNBOOK lines above are owed by the factory/registry owner");
+
+        _recordAddress("LIGHTER_PERP_TEMPLATE", template);
+        vm.serializeUint("lighter", "block", block.number);
+        vm.serializeAddress("lighter", "deployer", msg.sender);
+        vm.serializeAddress("lighter", "strategyFactory", factory);
+        vm.serializeAddress("lighter", "tierRegistry", registry);
+        _recordMeta("lighter", vm.serializeBool("lighter", "ownerStepsComplete", complete));
+    }
+
+    /// @notice Check a recorded deployment against the chain, without
+    ///         deploying: `--sig 'verify()'`. Reads `LIGHTER_PERP_TEMPLATE` from
+    ///         this repo's book and the v1 singletons from the protocol's.
+    function verify() external view {
+        _requireLighterChain();
+        verifyDeployment(
+            _requireProtocolAddress("STRATEGY_FACTORY"),
+            _requireProtocolAddress("TIER_REGISTRY"),
+            _requireDeployedAddress("LIGHTER_PERP_TEMPLATE"),
+            venue().zkLighter
+        );
+    }
+
+    /// @notice Every property a correct deployment has, asserted. The owner
+    ///         steps are checked as FACTS here (unlike `ceremony`, which degrades
+    ///         them to runbook lines): a deployment still owed Safe transactions
+    ///         fails verification until they land.
+    function verifyDeployment(address factory, address registry, address template, address zkLighter) public view {
+        require(template.code.length != 0, "LIGHTER_PERP_TEMPLATE holds no code");
+        require(
+            LighterPerpStrategy(template).vault() == address(0), "LIGHTER_PERP_TEMPLATE is a clone, not the template"
+        );
+        require(TierRegistry(registry).strategyFactory() == factory, "TIER_REGISTRY does not point at STRATEGY_FACTORY");
+        require(StrategyFactory(factory).approvedTemplate(template), "template not approved on StrategyFactory");
+        require(TierRegistry(registry).isCounterpartyAllowed(zkLighter), "ZK_LIGHTER not counterparty-allowed");
+        assertUncertified(registry, template);
+        console.log("verified: LIGHTER_PERP_TEMPLATE", template);
     }
 
     /// @notice The ceremony, with the book passed in so a test can drive it
@@ -215,23 +254,9 @@ contract DeployLighterTemplate is Script {
         console.log("venue verified: tokenToAssetIndex(USDG) ==", v.usdgAssetIndex);
     }
 
-    /// @dev Env first, then the pinned protocol's address book. Reverts, naming
-    ///      the key, when neither has it: on 4663 the v1 core ceremony has to
-    ///      have run before a template can be added at all.
-    function _protocolAddress(string memory key) internal view returns (address) {
-        address fromEnv = vm.envOr(key, address(0));
-        if (fromEnv != address(0)) return fromEnv;
-        string memory path =
-            string.concat(vm.projectRoot(), "/lib/sherwood-protocol/chains/", vm.toString(block.chainid), ".json");
-        string memory json = vm.readFile(path);
-        string memory k = string.concat(".", key);
-        require(vm.keyExistsJson(json, k), string.concat(key, " not in env or the protocol address book"));
-        return vm.parseJsonAddress(json, k);
-    }
-
     function _requireLighterChain() internal view {
         require(
-            block.chainid == CHAIN_ROBINHOOD || block.chainid == CHAIN_ROBINHOOD_FORK,
+            _isRobinhood(),
             "wrong chain: LighterPerpStrategy exists only on Robinhood mainnet 4663 and its 9994663 fork"
         );
     }

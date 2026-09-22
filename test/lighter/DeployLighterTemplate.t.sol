@@ -62,6 +62,22 @@ contract DeployLighterTemplateTest is Test {
         assertFalse(registry.isCounterpartyAllowed(ZK));
     }
 
+    function test_verify_acceptsACompleteCeremony() public {
+        (address template,) = script.ceremony(address(factory), address(registry), ZK, address(script));
+        script.verifyDeployment(address(factory), address(registry), template, ZK);
+    }
+
+    function test_verify_refusesADeploymentStillOwedOwnerSteps() public {
+        (address template,) = script.ceremony(address(factory), address(registry), ZK, makeAddr("deployerKey"));
+        vm.expectRevert(bytes("template not approved on StrategyFactory"));
+        script.verifyDeployment(address(factory), address(registry), template, ZK);
+    }
+
+    function test_verify_refusesACodelessTemplate() public {
+        vm.expectRevert(bytes("LIGHTER_PERP_TEMPLATE holds no code"));
+        script.verifyDeployment(address(factory), address(registry), makeAddr("nothing"), ZK);
+    }
+
     function test_ceremony_venueAlreadyAllowed_isIdempotent() public {
         vm.prank(address(script));
         registry.setCounterpartyAllowed(ZK, true);

@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy, IAgentSet} from "@sherwood/strategies/BaseStrategy.sol";
 import {IStrategy} from "@sherwood/interfaces/IStrategy.sol";
-import {IStrategyDelivery} from "@sherwood/interfaces/IStrategyDelivery.sol";
 import {IZkLighter} from "./IZkLighter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
@@ -56,14 +55,22 @@ interface ITierBindingPath {
  *
  *   Lane-B only: the venue exposes no on-chain mark anything here could trust —
  *   positions and margin are off-chain sequencer state and `IZkLighter` has no
- *   accessor for either — so the vault never prices an in-flight Lighter
- *   position and deposits/redeems settle at the frozen per-proposal queue price.
- *   `BaseStrategy` no longer carries a `positions()` / `selfManagesFees()` /
- *   `availableLiquidity()` / `withdrawTo()` surface to opt out of; what a
- *   template says about value it still holds is now `IStrategyDelivery`, and
- *   this template's three answers are `hasUndeliveredValue()`,
- *   `undeliveredValue()` and `hasUnvaluedResidue()` below — the last of which is
- *   how it declares the L2 margin it structurally cannot value.
+ *   accessor for either. On protocol v1 that is simply how every template is
+ *   treated: the vault's NAV is its idle asset balance, deposits and redemptions
+ *   are shut while a proposal is open, and queued redemptions settle at the
+ *   per-proposal price `onProposalSettled` stamps after this clone's `settle()`.
+ *
+ *   WHAT THIS TEMPLATE NO LONGER DECLARES. On `post-audit` it answered
+ *   `IStrategyDelivery` (`hasUndeliveredValue` / `undeliveredValue` /
+ *   `hasUnvaluedResidue`), which is how it told the vault about L2 margin it
+ *   could not value, and it exposed an `onlyVault` `sweep()` door for the
+ *   vault's `collectResidue`. v1 deleted that machinery and nothing on-chain
+ *   reads either answer any more. Whether margin is still sitting at Lighter
+ *   after settlement is now OFF-CHAIN KNOWLEDGE ONLY — the CLI / agent read it
+ *   from the Lighter API — and the protocol makes no decision on it. The
+ *   on-chain recovery path for anything that arrives late is `queueWithdraw`
+ *   (still callable when `Settled`) → `recoverResiduals()` (claim onto this
+ *   clone) → `BaseStrategy.rescueTo(USDG)` from a vault batch.
  */
 contract LighterPerpStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
@@ -126,9 +133,17 @@ contract LighterPerpStrategy is BaseStrategy {
     /// @notice Cumulative ticks requested via `queueWithdraw`. The settle guard's
     ///         denominator: nothing settles until this much has come back.
     uint256 public queuedTicks;
-    /// @notice Cumulative USDG this contract has pushed to the vault (settle push
-    ///         + every sweep). Monotone, so a `collectResidue` sweep can never
-    ///         shrink what the settle guard counts as delivered.
+    /// @notice Cumulative USDG this contract has pushed to the vault itself —
+    ///         which on v1 means the `_settle` push, and nothing else. Monotone,
+    ///         so the settle guard's `accounted` figure only ever grows through
+    ///         this term.
+    /// @dev    DOES NOT COUNT `BaseStrategy.rescueTo`. That door is inherited,
+    ///         `onlyVault`, not `virtual`, and moves the balance without a hook
+    ///         this template could observe. A vault batch that rescues USDG off
+    ///         this clone BEFORE `settle()` therefore shrinks `accounted` by what
+    ///         it moved; the settle guard then reads that as a shortfall and
+    ///         `acknowledgeShortfall()` is the way through. Nothing is lost —
+    ///         the rescued USDG is already in the vault.
     uint256 public returnedAssets;
     /// @notice Proposer/vault-owner assertion that settling below `queuedTicks`
     ///         is intended (venue under-fill / write-off). Settle's escape hatch.
@@ -196,7 +211,7 @@ contract LighterPerpStrategy is BaseStrategy {
     /// @notice Decode: (bytes apiKeyPubKey, uint8 apiKeyIndex, uint16[] markets, uint256 depositAmount)
     /// @dev `depositAmount` IS MANDATORY AND EXPLICIT. It used to accept 0 as
     ///      "dynamic-all" — pull whatever USDG the vault happens to hold at
-    ///      execute. That mode cannot survive the post-audit governor: the batch
+    ///      execute. That mode cannot survive the v1 governor: the batch
     ///      that executes this proposal is checked against a per-call cap, and
     ///      `SyndicateVault` refuses a pull that would breach `QueueReserveBreached`
     ///      or `BufferBreached`. All three are decided against a SIZE, and a size
@@ -208,10 +223,10 @@ contract LighterPerpStrategy is BaseStrategy {
     ///      ALSO BINDS THE VAULT ASSET. The venue asset is a `constant` in this
     ///      template, so a vault whose ERC-4626 asset is anything else would have
     ///      every pull and every push denominated in a token that vault does not
-    ///      account for — `_pushToVault` would credit it nothing measurable and
-    ///      the residue probes below would report a figure in the wrong unit.
-    ///      Same bind, same reason, as `MorphoSupplyStrategy`'s
-    ///      `LoanAssetMismatch`.
+    ///      account for — `_pushToVault` would credit it nothing the governor's
+    ///      asset-delta P&L can see, and every tick-to-asset comparison in the
+    ///      settle guard would be in the wrong unit. Same bind, same reason, as
+    ///      `MorphoSupplyStrategy`'s `LoanAssetMismatch`.
     function _initialize(bytes calldata data) internal override {
         (bytes memory pubKey, uint8 keyIndex, uint16[] memory mkts, uint256 depositAmount_) =
             abi.decode(data, (bytes, uint8, uint16[], uint256));
@@ -283,7 +298,7 @@ contract LighterPerpStrategy is BaseStrategy {
 
         // RE-CERTIFY THE VENUE, and here only. Blocking `execute()` strands
         // nothing — the proposal expires at `executeBy` with the vault untouched
-        // — while blocking `settle()`/`sweep()` would strand capital already at
+        // — while blocking `settle()`/`recoverResiduals()` would strand capital already at
         // Lighter. Degrades OPEN on an unresolved registry, which `_initialize`
         // has already refused to allow at bind time; the case that remains is a
         // registry unwired AFTER the clone was initialized, where the honest
@@ -297,8 +312,8 @@ contract LighterPerpStrategy is BaseStrategy {
         ZK_LIGHTER.deposit(address(this), USDG_ASSET_INDEX, ROUTE_PERPS, amountIn);
 
         // RECORDED, because from here on `depositAmount` is only a declaration.
-        // The unwind, the CLI's drain sizing and the residue probes all reason
-        // about what actually left the vault.
+        // The unwind and the CLI's drain sizing both reason about what actually
+        // left the vault.
         deployedAmount = amountIn;
 
         // `_acct()` reverts if the venue did not register the account in this tx.
@@ -488,8 +503,8 @@ contract LighterPerpStrategy is BaseStrategy {
     ///         otherwise hold `_settle` shut. Proposer or vault owner asserts the
     ///         shortfall is real and settlement should book it. It only relaxes a
     ///         timing gate — it cannot redirect funds, and anything that matures
-    ///         later is still recoverable post-settle via `queueWithdraw` +
-    ///         `recoverResiduals`.
+    ///         later is still recoverable post-settle via `queueWithdraw` →
+    ///         `recoverResiduals` → a vault batch's `rescueTo(USDG)`.
     ///
     ///         R3: the waiver is gated on an ACTUAL, currently-observable
     ///         shortfall. Ungated it was a one-call bypass of BOTH settle guards
@@ -498,17 +513,18 @@ contract LighterPerpStrategy is BaseStrategy {
     ///         principal as a 100% loss with the funds still at the venue. The
     ///         stranding is recoverable (C1), but the damage is the Lane-B price
     ///         stamp: `onProposalSettled` freezes the per-proposal redeem price
-    ///         at the deflated NAV, so a later `recoverResiduals` top-up lands
-    ///         AFTER the stamp and the haircut falls on the exiting LPs.
+    ///         at the deflated NAV, so a later top-up lands AFTER the stamp and
+    ///         the haircut falls on the exiting LPs.
     ///         Preconditions, all three necessary:
     ///           - `ReturnsNotInitiated` — you cannot acknowledge a shortfall on
     ///             positions that were never closed.
     ///           - `NothingQueued`       — nor on a drain that was never asked
     ///             for; there is no denominator to fall short of.
     ///           - `NoShortfall`         — nor when everything asked for is
-    ///             already accounted. `returnedAssets` is monotone so `accounted`
-    ///             only grows: if it ever reaches `queuedTicks`, `_settle` passes
-    ///             unaided and the waiver is not needed. Arming while
+    ///             already accounted. Absent a vault-batch `rescueTo` (see
+    ///             `returnedAssets`) `accounted` only grows: if it ever reaches
+    ///             `queuedTicks`, `_settle` passes unaided and the waiver is not
+    ///             needed. Arming while
     ///             `accounted == 0` (nothing matured yet) stays legal — that is
     ///             the normal venue-under-fill case.
     function acknowledgeShortfall() external {
@@ -559,158 +575,48 @@ contract LighterPerpStrategy is BaseStrategy {
         if (!shortfallAcknowledged) {
             if (queuedTicks == 0) revert NothingQueued();
             // 1 tick == 1 USDG base unit (both 6dp), so ticks and assets compare
-            // directly. `returnedAssets` keeps the total MONOTONE: a
-            // `collectResidue` sweep immediately before settle moves value to
-            // the vault without shrinking what counts as delivered.
+            // directly.
             uint256 accounted = returnedAssets + pending + bal;
             if (accounted < queuedTicks) revert WithdrawalInFlight(queuedTicks, accounted);
         }
 
         if (pending > 0) ZK_LIGHTER.withdrawPendingBalance(address(this), USDG_ASSET_INDEX, pending);
-        _sweep();
+        _deliver();
 
         settled = true;
         emit Settled();
     }
 
-    /// @dev Claim everything the venue has matured for this contract. Shared by
-    ///      `sweep()` and the permissionless `recoverResiduals()`; `_settle`
-    ///      keeps its own inline claim because it has already read `pending` for
-    ///      the settle guard and must not pay for the read twice.
-    function _claimMatured() internal returns (uint128 pending) {
-        pending = ZK_LIGHTER.getPendingBalance(address(this), USDG_ASSET_INDEX);
-        if (pending > 0) ZK_LIGHTER.withdrawPendingBalance(address(this), USDG_ASSET_INDEX, pending);
-    }
-
     /// @notice Claim any matured pending balance from the venue INTO THIS
-    ///         CONTRACT. Permissionless, repeatable, and NOT gated on `settled`.
-    /// @dev    CLAIM-ONLY, AND DELIBERATELY NOT A PUSH. It used to push to the
-    ///         vault as well, which made it a SECOND door onto the balance delta
-    ///         `SyndicateVault._recoverResidueVia` measures across `sweep()`.
-    ///         That delta is a complete measurement only while there is exactly
-    ///         one door: assets arriving outside the window credit the exited
-    ///         redeem cohort nothing (`_payCohortShare` sees zero) and silently
-    ///         lift the price for whoever stayed — unrepairably, because the
-    ///         delta is spent. `MorphoSupplyStrategy.sweep` and
-    ///         `ConcentratedLiquidityStrategy.sweep` were made `onlyVault` for
-    ///         exactly this reason and this template now matches them.
-    ///
-    ///         What is preserved is the property that made this permissionless
-    ///         in the first place (H-4): a proposal resolved through
+    ///         CONTRACT. Permissionless, repeatable, any lifecycle state.
+    /// @dev    CLAIM-ONLY, AND DELIBERATELY NOT A PUSH. The permissionless half
+    ///         is the H-4 property: a proposal resolved through
     ///         `finalizeEmergencySettle` never calls `strategy.settle()`, so
-    ///         nobody privileged may be around to move matured funds off the
-    ///         venue. Anyone may still do that half, at any time, with no
-    ///         privilege — the USDG simply lands HERE, where the vault's own
-    ///         permissionless `collectResidue(this)` then measures and collects
-    ///         it through the single door.
+    ///         nobody privileged need be around to move matured funds off the
+    ///         venue, and `withdrawPendingBalance` is itself permissionless at
+    ///         Lighter anyway — this is a convenience wrapper, not a new power.
+    ///
+    ///         Why it stops at this clone instead of pushing on to the vault: on
+    ///         v1 the only thing that turns USDG in the vault into share value is
+    ///         the vault's idle balance, and the vault is open to deposits
+    ///         whenever no proposal is open. A permissionless push would let
+    ///         anyone choose the block a late tranche lands in NAV, i.e. deposit
+    ///         in front of it and take a slice of recovered principal that
+    ///         belonged to the LPs who carried the loss. `BaseStrategy.rescueTo`
+    ///         is `onlyVault`, so the push happens inside a governor batch, and
+    ///         batches only run while a proposal is open — when deposits are
+    ///         shut. The removed `onlyVault` `sweep()` did the claim and the push
+    ///         in one call for `post-audit`'s `collectResidue`; v1 has no such
+    ///         dispatcher, and a batch can carry `[recoverResiduals(),
+    ///         rescueTo(USDG)]` against this clone to get the same effect. The
+    ///         price of routing through a batch: the vault's governor measures
+    ///         P&L as the vault's asset delta across the proposal, so a late
+    ///         tranche rescued inside a LATER proposal's batch is booked as that
+    ///         proposal's profit and pays its performance fee. Accepted — the
+    ///         alternative is a front-runnable NAV jump.
     function recoverResiduals() external {
-        _claimMatured();
-    }
-
-    /// @notice The vault's residue door: claim whatever has matured at the venue
-    ///         and push this contract's whole USDG balance home.
-    /// @dev    `onlyVault`, and the selector is load-bearing —
-    ///         `SyndicateVault.collectResidue` dispatches `bytes4(keccak256("sweep()"))`
-    ///         (`_SEL_SWEEP == 0x35faa416`) with the result ignored, so the name
-    ///         is part of the ABI contract with the vault. Renamed from
-    ///         `sweepToVault()`, which that dispatch could never reach.
-    ///
-    ///         NOT GATED ON `State.Settled`, unlike both sibling templates. The
-    ///         H-4 reasoning holds here and does not hold there: a Lighter clone
-    ///         resolved by `finalizeEmergencySettle` stays `Executed` forever
-    ///         while still holding — or still owed — real USDG, and a
-    ///         `Settled`-gated door would strand it permanently with no
-    ///         permissionless way out. The siblings accept that gate because
-    ///         their residue is a lending position the vault can still see; this
-    ///         template's residue is a venue balance it cannot.
-    ///
-    ///         Idempotent and safe to call with nothing to move.
-    /// @return assets The USDG pushed to the vault this call.
-    function sweep() external onlyVault returns (uint256 assets) {
-        _claimMatured();
-        return _sweep();
-    }
-
-    // ── IStrategyDelivery (the vault's residue probes) ──
-
-    /// @inheritdoc IStrategyDelivery
-    /// @dev True while a settled clone still holds USDG, or is still owed USDG
-    ///      the venue has matured — exactly what `sweep()` above would move. The
-    ///      vault reads it under `_PROBE_GAS` (150k) to keep deposits shut over
-    ///      that window, because `totalAssets()` prices anything held here at
-    ///      zero and a depositor would otherwise mint against a NAV missing it.
-    ///
-    ///      SAME BASIS AS `undeliveredValue()` — both read the pending balance
-    ///      plus the idle balance, ticks 1:1 with USDG base units (both 6dp), no
-    ///      conversion and no price source in either — but NOT the same
-    ///      arithmetic: this bool applies the `RESIDUE_DUST` floor to EACH term,
-    ///      while the amount is the unfiltered sum. Two sub-dust terms
-    ///      (e.g. 900 + 900) therefore report `false` here with a nonzero
-    ///      `undeliveredValue()` of 1,800 — deliberate (each term alone is
-    ///      donation-sized dust; `test_delivery_dustDonation_doesNotTripTheLock`
-    ///      pins the shape) and bounded at `2 * RESIDUE_DUST`, matching
-    ///      `MorphoSupplyStrategy`'s identical per-term floor. Two staticcalls,
-    ///      no loops — comfortably inside the probe cap.
-    ///
-    ///      `Settled` ONLY, matching both sibling templates and for their reason
-    ///      rather than a new one: answering for `Executed` too would report
-    ///      residue on every live proposal, since a clone mid-strategy always has
-    ///      value at the venue. That is what `openProposalCount() != 0` already
-    ///      gates, so it would be redundant — and it would shut deposits for the
-    ///      whole strategy period on top of it.
-    function hasUndeliveredValue() public view override returns (bool) {
-        if (_state != State.Settled) return false;
-        if (uint256(ZK_LIGHTER.getPendingBalance(address(this), USDG_ASSET_INDEX)) > RESIDUE_DUST) return true;
-        return USDG.balanceOf(address(this)) > RESIDUE_DUST;
-    }
-
-    /// @inheritdoc IStrategyDelivery
-    /// @dev USDG IS the vault asset (`_initialize` binds it against
-    ///      `IERC4626(vault()).asset()`), and a withdrawal tick IS a USDG base
-    ///      unit, so both terms are already denominated in vault-asset units.
-    ///      No oracle, no pool read, and nothing an attacker can move inside the
-    ///      settlement transaction.
-    function undeliveredValue() public view override returns (uint256) {
-        if (_state != State.Settled) return 0;
-        return uint256(ZK_LIGHTER.getPendingBalance(address(this), USDG_ASSET_INDEX)) + USDG.balanceOf(address(this));
-    }
-
-    /// @inheritdoc IStrategyDelivery
-    /// @dev THE EXACT COMPLEMENT OF WHAT `undeliveredValue()` CAN SEE. That
-    ///      figure counts matured ticks and idle USDG — everything that has
-    ///      already crossed back onto L1. It cannot count the margin still SITTING
-    ///      at Lighter: positions and margin are off-chain sequencer state and
-    ///      `IZkLighter` exposes no accessor for either, which is the same reason
-    ///      this template is Lane-B and reports no positions at all.
-    ///
-    ///      So this declares the two states in which unpriced value is still out
-    ///      there, and the vault refuses to mint at all while either holds:
-    ///        - `returnedAssets < queuedTicks` — a drain was asked for and has not
-    ///          fully arrived. Reachable after settlement too, because
-    ///          `queueWithdraw` stays callable in `Settled` (C1) precisely so an
-    ///          under-withdraw can be corrected.
-    ///        - `shortfallAcknowledged` — settlement was let through on the
-    ///          assertion that the venue under-filled. That assertion says the
-    ///          contract could not verify its own L2 balance, which is exactly
-    ///          "there may be value here I cannot value".
-    ///
-    ///      THE DEPOSIT-LOCK CONSEQUENCE, STATED PLAINLY. A true here marks the
-    ///      clone in `SyndicateVault._recordResidue` and shuts vault deposits —
-    ///      but only for `UNVALUED_MAX_LOCK` from the mark, after which
-    ///      `depositsLocked()` reads false again and anyone may
-    ///      `pruneUnvaluedMark(this)` to burn the mark and re-arm the gate for
-    ///      the next one. So an acknowledged shortfall, which never clears on its
-    ///      own, costs the vault one bounded deposit window and not a permanent
-    ///      freeze. A clean settle — everything queued came back, no shortfall —
-    ///      answers false immediately and locks nothing.
-    ///
-    ///      Storage reads only: no external call, so no venue outage and no gas
-    ///      griefing can suppress this probe the way an IRM could suppress
-    ///      Morpho's.
-    function hasUnvaluedResidue() public view override returns (bool) {
-        if (_state != State.Settled) return false;
-        if (shortfallAcknowledged) return true;
-        return returnedAssets < queuedTicks;
+        uint128 pending = ZK_LIGHTER.getPendingBalance(address(this), USDG_ASSET_INDEX);
+        if (pending > 0) ZK_LIGHTER.withdrawPendingBalance(address(this), USDG_ASSET_INDEX, pending);
     }
 
     // ── Views ──
@@ -746,7 +652,7 @@ contract LighterPerpStrategy is BaseStrategy {
     ///      skipped the LIVE agent-set re-check `onlyProposer` performs — so
     ///      `SyndicateVault.removeAgent` did not actually revoke anything on an
     ///      already-deployed clone, and the whole point of the pashov finding-#9
-    ///      fix (`BaseStrategy.sol:103-136`) was that revocation must bite.
+    ///      fix (`BaseStrategy.onlyProposer`) was that revocation must bite.
     ///
     ///      Byte-for-byte the same read as the modifier, including the raw
     ///      staticcall and the explicit length check: a typed call into a vault
@@ -782,19 +688,26 @@ contract LighterPerpStrategy is BaseStrategy {
     ///      third-party rollup whose sequencer this protocol does not control;
     ///      "stop opening new positions there, now" needs to be one owner call.
     ///
-    ///      The counterparty axis and not the adapter axis, for CL's reason:
-    ///      `setAdapterAllowed` is the flag `SyndicateVault._guardBatchCalls`
-    ///      reads to decide whether proposer-authored calldata may name an
-    ///      address as an approve spender or transfer recipient. Listing the
-    ///      venue there would widen the batch guard as a side effect of a
-    ///      strategy decision. `isCounterpartyAllowed` is the weak grant — a
-    ///      CERTIFIED TEMPLATE may approve this from inside its own reviewed code
-    ///      path — which is exactly what `_execute` does.
+    ///      On v1 `isCounterpartyAllowed` is the ONLY address axis the
+    ///      `TierRegistry` keeps, and it confers nothing on a governor batch —
+    ///      the vault admits batch targets structurally (a registered strategy
+    ///      or the vault asset under `AssetCallRules`). So the grant means
+    ///      exactly "a reviewed template may hand this address funds from inside
+    ///      its own code path", which is what `_execute`'s `forceApprove` +
+    ///      `deposit` does and nothing more.
+    ///
+    ///      CODEHASH CAVEAT. The registry snapshots the counterparty's codehash
+    ///      at grant time and stops vouching if it changes. `ZK_LIGHTER` is a
+    ///      proxy, whose runtime code does not change across an implementation
+    ///      upgrade, so a Lighter upgrade does NOT drop the grant. Re-review on
+    ///      every venue upgrade is an operator duty; the switch below is how to
+    ///      act on it.
     ///
     ///      Called from `_initialize` (fail-CLOSED, including on an unresolved
     ///      registry) and from `_execute` (re-certified, degrading OPEN on an
-    ///      unresolved registry). Deliberately NOT from `_settle`, `sweep` or
-    ///      `recoverResiduals`: those are the exit path, and gating them would
+    ///      unresolved registry). Deliberately NOT from `initiateReturn`,
+    ///      `queueWithdraw`, `_settle`, `recoverResiduals` or the guardrails:
+    ///      those are the exit path and the kill switch, and gating them would
     ///      hand a demotion — or an unreachable registry — the power to freeze
     ///      capital already at the venue. `MorphoSupplyStrategy._requireAllowedMorpho`
     ///      spells the same asymmetry out.
@@ -849,15 +762,29 @@ contract LighterPerpStrategy is BaseStrategy {
     ///      unscaled `depositAmount` and still breaks the per-call cap. The
     ///      ratio form cannot: `floor(dep * floor(max*r/q) / max) <=
     ///      floor(dep * r / q) = scaledCap_i` for any `dep <= cap_i`, because the
-    ///      inner floor only ever moves the numerator DOWN. The residue is at
-    ///      most a couple of base units, always on the safe side.
+    ///      inner floor only ever moves the numerator DOWN. The rounding gap is
+    ///      at most a couple of base units, always on the safe side.
+    ///
+    ///      RE-VERIFIED AGAINST v1 (`SyndicateGovernor.executeProposal` →
+    ///      `_deriveAndStoreEffectiveCapital`). The governor writes
+    ///      `effectiveMaxCapital` BEFORE it hands the batch to the vault, so the
+    ///      read below sees this execution's figure, and `getRiskEnvelope` still
+    ///      returns the declared `maxCapital`. v1's `_scaleCaps` adds one step
+    ///      post-audit did not have — it trims the largest scaled cap when the
+    ///      scaled caps sum past `effectiveMaxCapital` — but that trim cannot
+    ///      fire on the execute leg: `propose` rejects `sum(executeCallCaps) >
+    ///      maxCapital` (`CallCapsExceedMaxCapital`), and a sum of floors is at
+    ///      most the floor of the sum, so the scaled caps never exceed
+    ///      `floor(maxCapital * r / q)`.
     ///
     ///      DEGRADES TO THE PINNED AMOUNT, and only there. An unresolvable
-    ///      governor, a governor predating `getEffectiveMaxCapital` (issue #27),
-    ///      a zero declared envelope, or an effective capital at or above the
-    ///      declared one all mean "nothing scaled this proposal" — and a
-    ///      governor that does not scale the envelope does not scale the caps
-    ///      either, so the pinned pull is exactly what such a batch expects.
+    ///      governor, one that does not answer either getter, a zero declared
+    ///      envelope, or an effective capital at or above the declared one all
+    ///      mean "nothing scaled this proposal" — and a governor that does not
+    ///      scale the envelope does not scale the caps either, so the pinned
+    ///      pull is exactly what such a batch expects. Every v1 governor answers
+    ///      both getters; the fallback is kept because it costs nothing and the
+    ///      alternative is an undecodable `execute()` revert.
     ///      Every read is a length-checked raw staticcall for the reason the
     ///      rest of this file gives: a typed call into a governor that cannot
     ///      answer would revert in THIS frame with no data, turning a missing
@@ -915,7 +842,7 @@ contract LighterPerpStrategy is BaseStrategy {
         return address(uint160(word));
     }
 
-    function _sweep() internal returns (uint256 bal) {
+    function _deliver() internal returns (uint256 bal) {
         bal = USDG.balanceOf(address(this));
         if (bal == 0) return 0;
         returnedAssets += bal;

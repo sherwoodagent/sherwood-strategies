@@ -112,18 +112,23 @@ abstract contract LighterPerpStrategyBase is Test {
         strategy.execute();
     }
 
-    /// @dev The real recovery path: `SyndicateVault.collectResidue(strategy)` is
-    ///      permissionless and dispatches `sweep()` (selector 0x35faa416) from the
-    ///      VAULT, measuring the arrival as a balance delta. Every test that used
-    ///      to call `sweepToVault()` directly goes through here instead, because
-    ///      that direct door is exactly what was removed.
-    function _collectResidue() internal returns (uint256) {
-        return _collectResidue(strategy);
+    /// @dev The v1 recovery path for anything that reaches the venue's pending
+    ///      balance after (or instead of) `settle()`: a governor batch carrying
+    ///      `[strategy.recoverResiduals(), strategy.rescueTo(USDG)]`. Both calls
+    ///      come from the VAULT here because that is who executes a batch;
+    ///      `recoverResiduals` would accept anyone, `rescueTo` accepts only the
+    ///      vault. Returns the vault's USDG delta.
+    function _vaultRescue() internal returns (uint256) {
+        return _vaultRescue(strategy);
     }
 
-    function _collectResidue(LighterPerpStrategy s) internal returns (uint256) {
-        vm.prank(attacker); // permissionless at the vault
-        return vaultC.collectResidue(address(s));
+    function _vaultRescue(LighterPerpStrategy s) internal returns (uint256) {
+        uint256 before = usdg.balanceOf(vault);
+        vm.startPrank(vault);
+        s.recoverResiduals();
+        s.rescueTo(USDG_ADDR);
+        vm.stopPrank();
+        return usdg.balanceOf(vault) - before;
     }
 
     /// @dev Full happy-path unwind: close → queue the true balance → mature → settle.
@@ -217,7 +222,7 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
     }
 
     /// @dev The "dynamic-all" mode (`depositAmount == 0` ⇒ pull the vault's whole
-    ///      USDG balance at execute) is GONE. It could not satisfy the post-audit
+    ///      USDG balance at execute) is GONE. It could not satisfy the v1
     ///      `executeGovernorBatch` per-call caps, and a batch whose pull size is
     ///      only knowable at execute time cannot be checked against
     ///      `QueueReserveBreached` / `BufferBreached` when the proposal is voted.
@@ -771,29 +776,6 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
         strategy.settle();
     }
 
-    /// @dev `returnedAssets` makes the guard monotone: a `collectResidue` sweep
-    ///      right before settle must not brick settlement.
-    function test_settle_sweepBeforeSettle_doesNotBrick() public {
-        _executeFirst();
-        vm.startPrank(proposer);
-        strategy.initiateReturn();
-        strategy.queueWithdraw(uint64(DEPOSIT));
-        vm.stopPrank();
-        zk.mature(address(strategy));
-        vm.roll(block.number + 1);
-
-        // Anyone drives the vault's permissionless door ahead of settle.
-        assertEq(_collectResidue(), DEPOSIT);
-        assertEq(strategy.returnedAssets(), DEPOSIT);
-        assertEq(usdg.balanceOf(address(strategy)), 0);
-        assertEq(strategy.pendingBalance(), 0);
-
-        vm.prank(vault);
-        strategy.settle(); // still reachable
-        assertEq(strategy.settled(), true);
-        assertEq(usdg.balanceOf(vault), DEPOSIT);
-    }
-
     function test_settle_claimsPendingAndPushes() public {
         _executeFirst();
         vm.startPrank(proposer);
@@ -1001,7 +983,7 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
 
         // The 5k the venue never matured is still drainable post-settle.
         zk.mature(address(strategy));
-        assertEq(_collectResidue(), 5_000e6);
+        assertEq(_vaultRescue(), 5_000e6);
         assertEq(usdg.balanceOf(vault), DEPOSIT - 5_000e6);
     }
 
@@ -1045,13 +1027,14 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
         strategy.queueWithdraw(uint64(stranded));
         zk.mature(address(strategy));
 
-        // Recovery stays permissionless — it just runs through the vault's own
-        // `collectResidue` door now, so the arrival is measured once.
-        assertEq(_collectResidue(), stranded);
+        // The claim is permissionless; the push home is a vault batch's
+        // `rescueTo(USDG)`, which `returnedAssets` does not count.
+        assertEq(_vaultRescue(), stranded);
 
         assertEq(usdg.balanceOf(vault), DEPOSIT); // fully recovered
         assertEq(zk.l2Balance(address(strategy)), 0);
-        assertEq(strategy.returnedAssets(), DEPOSIT);
+        assertEq(strategy.returnedAssets(), 1); // only the settle push
+        assertEq(usdg.balanceOf(address(strategy)), 0);
     }
 
     /// @dev The vault owner can drive the same recovery if the proposer key dies.
@@ -1069,7 +1052,7 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
         vm.prank(owner);
         strategy.queueWithdraw(uint64(DEPOSIT - 1));
         zk.mature(address(strategy));
-        _collectResidue();
+        _vaultRescue();
         assertEq(usdg.balanceOf(vault), DEPOSIT);
     }
 
@@ -1144,7 +1127,9 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
     /// @dev A proposal resolved through `finalizeEmergencySettle` executes
     ///      owner-supplied calls and finishes settlement in the GOVERNOR without
     ///      ever calling `strategy.settle()`. The old `settled == true` gate on
-    ///      the recovery paths bricked them in exactly that case.
+    ///      the recovery paths bricked them in exactly that case. On v1 the
+    ///      recovery is a later batch's `[recoverResiduals(), rescueTo(USDG)]`,
+    ///      neither of which is gated on the lifecycle state.
     function test_H4_recoveryWorksWithoutStrategySettle() public {
         _executeFirst();
         vm.startPrank(proposer);
@@ -1159,34 +1144,32 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
         assertEq(strategy.settled(), false);
 
         uint256 vaultBefore = usdg.balanceOf(vault);
-        assertEq(_collectResidue(), DEPOSIT);
+        assertEq(_vaultRescue(), DEPOSIT);
 
         assertEq(usdg.balanceOf(vault) - vaultBefore, DEPOSIT);
-        assertEq(strategy.returnedAssets(), DEPOSIT);
+        assertEq(strategy.pendingBalance(), 0);
+        assertEq(usdg.balanceOf(address(strategy)), 0);
     }
 
-    /// @dev H-4, restated for the renamed door: `sweep()` is NOT gated on
-    ///      `State.Settled` (both sibling templates are), because an
-    ///      emergency-settled Lighter clone stays `Executed` forever while still
-    ///      holding USDG the vault cannot see.
-    function test_H4_sweepWorksBeforeSettle() public {
+    /// @dev H-4 on v1: `BaseStrategy.rescueTo` is not gated on the lifecycle
+    ///      state, so an emergency-settled Lighter clone that stays `Executed`
+    ///      forever can still hand its USDG home.
+    function test_H4_rescueWorksBeforeSettle() public {
         _executeFirst();
         usdg.mint(address(strategy), 250e6); // stray USDG lands mid-strategy
 
         uint256 vaultBefore = usdg.balanceOf(vault);
-        assertEq(_collectResidue(), 250e6);
+        assertEq(_vaultRescue(), 250e6);
         assertEq(usdg.balanceOf(vault) - vaultBefore, 250e6);
-        assertEq(strategy.returnedAssets(), 250e6);
         assertEq(uint8(strategy.state()), uint8(BaseStrategy.State.Executed));
     }
 
     // ==================== RESIDUAL RECOVERY ====================
 
     /// @dev CLAIM-ONLY. `recoverResiduals` stays permissionless — that is the
-    ///      H-4 property — but it now lands the USDG on the CLONE and never
-    ///      pushes. Pushing directly was a second door onto the balance delta
-    ///      `SyndicateVault._recoverResidueVia` measures, which would credit the
-    ///      exited redeem cohort nothing and lift the stayers' price instead.
+    ///      H-4 property — but it lands the USDG on the CLONE and never pushes:
+    ///      a permissionless push would let anyone pick the block a late tranche
+    ///      lands in the vault's NAV while deposits are open.
     function test_recoverResiduals_claimsToCloneNotVault() public {
         _settleClean();
         // A late tranche matures after settlement.
@@ -1205,65 +1188,45 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
         assertEq(strategy.returnedAssets(), DEPOSIT); // unchanged: nothing delivered
         assertEq(strategy.pendingBalance(), 0);
 
-        // The single measured door then delivers it.
-        assertEq(_collectResidue(), 500e6);
+        // A vault batch's `rescueTo(USDG)` then delivers it.
+        vm.prank(vault);
+        strategy.rescueTo(USDG_ADDR);
         assertEq(usdg.balanceOf(vault) - vaultBefore, 500e6);
-        assertEq(strategy.returnedAssets(), DEPOSIT + 500e6);
+        assertEq(usdg.balanceOf(address(strategy)), 0);
     }
 
-    /// @dev `sweep()` claims AND pushes, so `collectResidue` alone recovers a
-    ///      matured tranche in one call — no separate `recoverResiduals` needed.
-    function test_sweep_claimsAndPushesInOneCall() public {
-        _settleClean();
-        usdg.mint(ZK, 500e6);
-        zk.creditL2(address(strategy), 500e6);
-        vm.prank(proposer);
-        strategy.queueWithdraw(500e6);
-        zk.mature(address(strategy));
-
-        uint256 vaultBefore = usdg.balanceOf(vault);
-        assertEq(_collectResidue(), 500e6);
-        assertEq(usdg.balanceOf(vault) - vaultBefore, 500e6);
-        assertEq(strategy.pendingBalance(), 0);
-    }
-
-    function test_sweep_pushesHeldBalance() public {
+    function test_rescueTo_pushesHeldBalanceAfterSettle() public {
         _settleClean();
         // USDG lands directly on the strategy (e.g. a third party claimed here).
         usdg.mint(address(strategy), 250e6);
 
         uint256 vaultBefore = usdg.balanceOf(vault);
-        assertEq(_collectResidue(), 250e6);
+        vm.prank(vault);
+        strategy.rescueTo(USDG_ADDR);
         assertEq(usdg.balanceOf(vault) - vaultBefore, 250e6);
-        assertEq(strategy.returnedAssets(), DEPOSIT + 250e6);
+        assertEq(strategy.returnedAssets(), DEPOSIT); // rescueTo is not counted
         assertEq(usdg.balanceOf(address(strategy)), 0);
     }
 
-    function test_sweep_zeroBalance_isNoOp() public {
-        _settleClean();
-        uint256 vaultBefore = usdg.balanceOf(vault);
-        assertEq(_collectResidue(), 0);
-        assertEq(usdg.balanceOf(vault), vaultBefore);
-    }
-
-    /// @dev THE POINT OF THE RENAME. `sweep()` is `onlyVault` so the vault's
-    ///      delta measurement stays the single door; a keeper calling it directly
-    ///      is what breaks `_payCohortShare`, and it does not need an attacker.
-    function test_sweep_nonVaultCaller_reverts() public {
+    /// @dev The PUSH is the vault's alone: nobody else can choose when a late
+    ///      tranche lands in the vault's NAV. Proposer and vault owner included —
+    ///      their lever is `queueWithdraw`, which only moves value TOWARD this
+    ///      clone.
+    function test_rescueTo_nonVaultCaller_reverts() public {
         _settleClean();
         usdg.mint(address(strategy), 250e6);
 
         vm.prank(attacker);
         vm.expectRevert(BaseStrategy.NotVault.selector);
-        strategy.sweep();
+        strategy.rescueTo(USDG_ADDR);
 
         vm.prank(proposer);
         vm.expectRevert(BaseStrategy.NotVault.selector);
-        strategy.sweep();
+        strategy.rescueTo(USDG_ADDR);
 
         vm.prank(owner);
         vm.expectRevert(BaseStrategy.NotVault.selector);
-        strategy.sweep();
+        strategy.rescueTo(USDG_ADDR);
 
         assertEq(usdg.balanceOf(address(strategy)), 250e6); // nothing moved
     }
@@ -1319,131 +1282,9 @@ contract LighterPerpStrategyTest is LighterPerpStrategyBase {
     }
 }
 
-/// @notice The post-audit additions: the `IStrategyDelivery` residue probes, the
-///         live-agent re-check on the proposer paths, the vault-owner liveness
-///         doors, and the TierRegistry counterparty bind.
-contract LighterPerpStrategyDeliveryTest is LighterPerpStrategyBase {
-    // ==================== IStrategyDelivery (residue probes) ====================
-
-    function test_delivery_pendingBeforeSettle_reportsNothing() public {
-        _executeFirst();
-        vm.startPrank(proposer);
-        strategy.initiateReturn();
-        strategy.queueWithdraw(uint64(DEPOSIT));
-        vm.stopPrank();
-        zk.mature(address(strategy));
-
-        // Executed, holding a matured claim — and still silent, because the
-        // vault is already gated by `openProposalCount() != 0` over this window.
-        assertFalse(strategy.hasUndeliveredValue());
-        assertEq(strategy.undeliveredValue(), 0);
-        assertFalse(strategy.hasUnvaluedResidue());
-    }
-
-    function test_delivery_cleanSettle_reportsNothing() public {
-        _settleClean();
-        assertFalse(strategy.hasUndeliveredValue());
-        assertEq(strategy.undeliveredValue(), 0);
-        assertFalse(strategy.hasUnvaluedResidue());
-    }
-
-    /// @dev Matured-but-unclaimed ticks are undelivered value: `sweep()` would
-    ///      move them, so the vault must not price a mint as if they were gone.
-    function test_delivery_maturedPendingAfterSettle_isUndelivered() public {
-        _settleClean();
-        usdg.mint(ZK, 500e6);
-        zk.creditL2(address(strategy), 500e6);
-        vm.prank(proposer);
-        strategy.queueWithdraw(500e6);
-        zk.mature(address(strategy));
-
-        assertTrue(strategy.hasUndeliveredValue());
-        assertEq(strategy.undeliveredValue(), 500e6);
-
-        _collectResidue();
-        assertFalse(strategy.hasUndeliveredValue());
-        assertEq(strategy.undeliveredValue(), 0);
-    }
-
-    /// @dev Idle USDG sitting on a settled clone counts the same way.
-    function test_delivery_idleBalanceAfterSettle_isUndelivered() public {
-        _settleClean();
-        usdg.mint(address(strategy), 250e6);
-        assertTrue(strategy.hasUndeliveredValue());
-        assertEq(strategy.undeliveredValue(), 250e6);
-    }
-
-    /// @dev `RESIDUE_DUST` (1e3) floors the BOOL but not the AMOUNT — same shape
-    ///      as both sibling templates. A 1-wei donation must not shut deposits.
-    function test_delivery_dustDonation_doesNotTripTheLock() public {
-        _settleClean();
-        usdg.mint(address(strategy), 1);
-        assertFalse(strategy.hasUndeliveredValue());
-        assertEq(strategy.undeliveredValue(), 1);
-
-        usdg.mint(address(strategy), 1_000); // now 1001 > RESIDUE_DUST
-        assertTrue(strategy.hasUndeliveredValue());
-    }
-
-    /// @dev A post-settle top-up drain is value the clone cannot price: the
-    ///      margin is still with the off-chain sequencer.
-    function test_delivery_queuedButUnreturned_isUnvalued() public {
-        _settleClean();
-        assertFalse(strategy.hasUnvaluedResidue());
-
-        usdg.mint(ZK, 500e6);
-        zk.creditL2(address(strategy), 500e6);
-        vm.prank(proposer);
-        strategy.queueWithdraw(500e6);
-        assertTrue(strategy.hasUnvaluedResidue()); // asked for, not back yet
-
-        zk.mature(address(strategy));
-        _collectResidue();
-        assertFalse(strategy.hasUnvaluedResidue()); // returnedAssets caught up
-    }
-
-    /// @dev An acknowledged shortfall is the contract SAYING it could not verify
-    ///      its own L2 balance, so it must declare the residue unvalued. This one
-    ///      never clears on its own — the vault bounds the cost at
-    ///      `UNVALUED_MAX_LOCK` and `pruneUnvaluedMark` burns the mark after.
-    function test_delivery_acknowledgedShortfall_isUnvaluedForever() public {
-        _armedShortfall();
-        vm.prank(proposer);
-        strategy.acknowledgeShortfall();
-        vm.prank(vault);
-        strategy.settle();
-
-        assertTrue(strategy.hasUnvaluedResidue());
-
-        // Even after draining everything the venue will ever pay.
-        zk.mature(address(strategy));
-        _collectResidue();
-        assertTrue(strategy.hasUnvaluedResidue());
-    }
-
-    /// @dev Every probe must fit inside `SyndicateVault._PROBE_GAS` (150k) or the
-    ///      vault reads it as unreadable and leaves the strategy counted forever.
-    function test_delivery_probesFitTheVaultGasCap() public {
-        _settleClean();
-        usdg.mint(address(strategy), 250e6);
-
-        uint256 g = gasleft();
-        strategy.hasUndeliveredValue();
-        uint256 usedBool = g - gasleft();
-
-        g = gasleft();
-        strategy.undeliveredValue();
-        uint256 usedAmount = g - gasleft();
-
-        g = gasleft();
-        strategy.hasUnvaluedResidue();
-        uint256 usedUnvalued = g - gasleft();
-
-        assertLt(usedBool, 150_000);
-        assertLt(usedAmount, 150_000);
-        assertLt(usedUnvalued, 150_000);
-    }
-
+/// @notice The live-agent re-check on the proposer paths, the vault-owner
+///         liveness doors, and the TierRegistry counterparty bind.
+contract LighterPerpStrategyAuthTest is LighterPerpStrategyBase {
     // ==================== LIVE-AGENT RE-CHECK (pashov #9) ====================
 
     /// @dev `queueWithdraw` / `acknowledgeShortfall` / `initiateReturn` used to
@@ -1597,9 +1438,9 @@ contract LighterPerpStrategyDeliveryTest is LighterPerpStrategyBase {
         strategy.settle();
         assertEq(usdg.balanceOf(vault), DEPOSIT);
 
-        // And the residue door too.
+        // And the late-arrival path too.
         usdg.mint(address(strategy), 250e6);
-        assertEq(_collectResidue(), 250e6);
+        assertEq(_vaultRescue(), 250e6);
     }
 
     /// @dev A registry unwired AFTER init degrades OPEN at execute, matching
@@ -1741,7 +1582,7 @@ contract LighterPerpStrategyCoverageTest is LighterPerpStrategyBase {
 
     /// @dev The unwind accounts against what was DEPLOYED, not what was
     ///      declared: a scaled clone that queues its deployed amount settles
-    ///      clean, with no shortfall waiver and no unvalued-residue mark.
+    ///      clean, with no shortfall waiver.
     function test_scaledClone_settlesCleanAgainstDeployedAmount() public {
         gov.setCapital(100_000e6, 63_000e6);
         _executeFirst();
@@ -1758,7 +1599,7 @@ contract LighterPerpStrategyCoverageTest is LighterPerpStrategyBase {
         strategy.settle();
 
         assertEq(strategy.returnedAssets(), deployed, "returnedAssets");
-        assertFalse(strategy.hasUnvaluedResidue(), "clean settle marks nothing");
+        assertFalse(strategy.shortfallAcknowledged(), "no waiver needed");
         assertEq(usdg.balanceOf(vault), DEPOSIT, "every USDG is home");
     }
 }
@@ -1791,20 +1632,6 @@ contract MockVaultForLighter {
 
     function isAgent(address who) external view returns (bool) {
         return _agents[who];
-    }
-
-    /// @dev A faithful shrink of `SyndicateVault._recoverResidueVia`: measure the
-    ///      vault's asset balance across a low-level, gas-capped `sweep()` into
-    ///      the strategy and report the delta. Permissionless here exactly as it
-    ///      is there, and the reason `sweep()` must be `onlyVault` — the real one
-    ///      splits this delta with the exited redeem cohort, which is only a
-    ///      complete measurement while `sweep()` is the single door.
-    function collectResidue(address strategy) external returns (uint256 collected) {
-        uint256 before = IERC20(asset).balanceOf(address(this));
-        // solhint-disable-next-line avoid-low-level-calls
-        (bool ok,) = strategy.call{gas: 1_500_000}(abi.encodeWithSelector(bytes4(0x35faa416)));
-        ok; // result deliberately ignored, as in the vault
-        return IERC20(asset).balanceOf(address(this)) - before;
     }
 }
 

@@ -71,8 +71,9 @@ interface ILaunchAdapter {
     ///                      exactly one job — the pro-rata claim on the launch
     ///                      RESERVE — and fees stay a plain vault receipt that
     ///                      a later proposal disposes of.
-    /// @param venueData     Venue-specific economics, opaque here. Sushi takes
-    ///                      none (the venue fixes price and supply);
+    /// @param venueData     Venue-specific economics, opaque here. Sushi V2
+    ///                      takes its liquidity mode and fee disposition (the
+    ///                      venue fixes price and supply);
     ///                      StonkBrokers takes its `CreateParams` economics —
     ///                      supply, start/graduation market caps, tax schedule,
     ///                      buffer, unsold mode, bond venue, per-wallet cap.
@@ -91,8 +92,9 @@ interface ILaunchAdapter {
     /// @notice What the venue did.
     /// @param token       The launched ERC-20.
     /// @param launchRef   Venue-scoped key for every later verb. Opaque to the
-    ///                    caller by design: Sushi keys by token address,
-    ///                    StonkBrokers by `(pad, id)` — a caller that had to
+    ///                    caller by design: the Sushi and StonkBrokers
+    ///                    adapters key by their per-launch clone, a singleton
+    ///                    venue could key by token address — a caller that had to
     ///                    know which would be a caller that had to know the
     ///                    venue.
     /// @param reserveHeld Launch tokens now held by the calling strategy.
@@ -146,7 +148,10 @@ interface ILaunchAdapter {
     ///      deliberately unconstrained here: a venue with a transferable
     ///      creator role can be a stateless singleton that hands the role back
     ///      in the same transaction; a venue that pins the role at creation
-    ///      needs a per-launch instance the strategy owns.
+    ///      needs a per-launch instance the strategy owns. What counts is
+    ///      where the FEE STREAM is pinned, not only the creator role: Sushi
+    ///      Launchpad V2's creator role transfers, but it pays a fee receiver
+    ///      fixed to the launcher, so it is the second kind.
     ///
     ///      Pulls `p.quoteIn` of `p.quoteToken` from `msg.sender`, plus the
     ///      venue's native launch fee per `nativeFeeSource()`. Declared payable

@@ -88,7 +88,7 @@ contract LighterPerpStrategy is BaseStrategy {
     ///      never leaves the venue. The cost is that the unwind carries NO
     ///      slippage protection and is an MEV / adverse-fill surface: a
     ///      searcher who can see the pending priority request may fill it at a
-    ///      punitive price. Accepted deliberately; see docs/LighterPerpStrategy.md.
+    ///      punitive price. Accepted deliberately; see docs/lighter/LighterPerpStrategy.md.
     uint32 internal constant MARKET_SELL_PRICE = 1;
     uint32 internal constant MARKET_BUY_PRICE = type(uint32).max;
 
@@ -453,7 +453,7 @@ contract LighterPerpStrategy is BaseStrategy {
         // both a SELL-close and a BUY-close per market — the one opposing the open
         // position fills, the other no-ops against a flat/absent position.
         // PROVEN on 4663, BOTH DIRECTIONS (H2 canary, account 623; see
-        // test/harness/LighterH2Canary.md). 2026-08-23, long side: the SELL
+        // test/lighter/harness/LighterH2Canary.md). 2026-08-23, long side: the SELL
         // closed a real long, the follow-on BUY no-opped against the flat book
         // (37 samples / 2 min). 2026-08-26, short mirror: the FIRST-fired SELL
         // left a real open short exactly unchanged, the BUY closed it, and a
@@ -603,7 +603,7 @@ contract LighterPerpStrategy is BaseStrategy {
     ///         OFF-CHAIN guarantee — the CLI's `queue-withdraw --all` reads the
     ///         true L2 balance from the Lighter API and hard-aborts on any nonzero
     ///         position — and it sits in the same trust bucket as the agent key.
-    ///         See the trust model in docs/LighterPerpStrategy.md.
+    ///         See the trust model in docs/lighter/LighterPerpStrategy.md.
     function _settle() internal override {
         if (returnsInitiatedAt == 0) revert ReturnsNotInitiated();
         if (block.number <= returnsInitiatedAt) revert SettleTooSoon();

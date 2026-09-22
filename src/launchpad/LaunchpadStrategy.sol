@@ -41,6 +41,7 @@ interface IVaultVotes {
     function clock() external view returns (uint48);
     function getPastVotes(address account, uint256 timepoint) external view returns (uint256);
     function getPastTotalSupply(uint256 timepoint) external view returns (uint256);
+    function withdrawalQueue() external view returns (address);
 }
 
 /**
@@ -321,6 +322,27 @@ contract LaunchpadStrategy is BaseStrategy {
     ///         shaped to remove.
     error FeeAcquisitionFailed(address feeToken, uint256 required, uint256 held);
 
+    /// @notice Covering the venue's launch fee would cost more than the voted
+    ///         `maxFeeIn`: either the venue repriced its fee, or the fee swap's
+    ///         spot quote says the fee token got expensive.
+    /// @dev    Adversary: `executeProposal` is permissionless, so a caller can
+    ///         move the fee token's price in the swap route, execute, and unwind
+    ///         in one transaction. The fee swap is sized from a spot quote, so
+    ///         without a voted bound a moved price makes the strategy OVERSPEND
+    ///         rather than revert, burning launch budget on a fee worth a
+    ///         fraction of a cent. The same bound catches the venue owner
+    ///         front-running execute with a fee increase.
+    error FeeAboveCap(uint256 cost, uint256 maxFeeIn);
+
+    /// @notice The vault's withdrawal queue cannot take a reserve slice.
+    /// @dev    The queue holds escrowed shares and so carries votes at the
+    ///         snapshot, but it can only ever move the vault asset and shares:
+    ///         launch tokens paid to it are stuck there for good. Its slice is
+    ///         left unclaimed instead and reaches the vault at settle with the
+    ///         rest of the unclaimed reserve. Refused for `claimFor` because that
+    ///         path is permissionless.
+    error QueueCannotClaim(address queue);
+
     /// @notice The asset -> quote swap returned less than `minQuoteOut`, or the
     ///         adapter delivered nothing.
     error QuoteAcquisitionFailed(uint256 received, uint256 minQuoteOut);
@@ -398,6 +420,14 @@ contract LaunchpadStrategy is BaseStrategy {
     /// @param claimWindow       Configured claim duration, clamped at execute.
     /// @param deadline          Venue deadline for the launch transaction.
     /// @param settleSlippageBps Tolerance on the settle-time quote conversion.
+    /// @param maxFeeIn          The most the venue's native launch fee may cost,
+    ///                          in the token that pays for it: the vault ASSET
+    ///                          when the fee token is the asset (held back from
+    ///                          the budget), otherwise the launch QUOTE (spent
+    ///                          directly, or swapped into the fee token). Voted,
+    ///                          because the fee is read live and the fee swap is
+    ///                          sized from a spot quote; see `FeeAboveCap`. May be
+    ///                          zero only for a venue that charges no fee.
     /// @param name              Launch token name.
     /// @param symbol            Launch token symbol.
     /// @param venueData         Venue-specific economics, opaque here.
@@ -415,6 +445,7 @@ contract LaunchpadStrategy is BaseStrategy {
         uint256 claimWindow;
         uint64 deadline;
         uint256 settleSlippageBps;
+        uint256 maxFeeIn;
         string name;
         string symbol;
         bytes venueData;
@@ -457,6 +488,7 @@ contract LaunchpadStrategy is BaseStrategy {
     uint256 public minTokensOut;
     uint256 public claimWindow;
     uint256 public settleSlippageBps;
+    uint256 public maxFeeIn;
     uint64 public deadline;
 
     /// @notice The claim pot actually recorded at execute.
@@ -586,6 +618,7 @@ contract LaunchpadStrategy is BaseStrategy {
         claimWindow = p.claimWindow;
         deadline = p.deadline;
         settleSlippageBps = p.settleSlippageBps;
+        maxFeeIn = p.maxFeeIn;
         _tokenName = p.name;
         _tokenSymbol = p.symbol;
         _quoteSwapData = p.quoteSwapData;
@@ -687,6 +720,11 @@ contract LaunchpadStrategy is BaseStrategy {
         // returndata at all, which reads as a bug in this template rather than
         // as the venue changing its terms.
         if (feeAmount != 0 && feeToken == address(0)) revert FeeAcquisitionFailed(feeToken, feeAmount, 0);
+        // On the two direct lanes the fee IS its cost: held back from the asset,
+        // or paid out of the quote. The swap lane is bounded in `_acquireFeeToken`.
+        if (feeAmount != 0 && (feeToken == asset || feeToken == quoteToken) && feeAmount > maxFeeIn) {
+            revert FeeAboveCap(feeAmount, maxFeeIn);
+        }
         uint256 heldBack = (feeAmount != 0 && feeToken == asset) ? feeAmount : 0;
 
         // 4 ── quote leg
@@ -779,8 +817,15 @@ contract LaunchpadStrategy is BaseStrategy {
     ///      only: probe the whole quote balance, derive the input that would
     ///      yield `need` at that rate, add `settleSlippageBps` of headroom, and
     ///      cap at what is actually held. The swap itself carries `need` as its
-    ///      own floor, and the post-condition is re-read from the token, so a
-    ///      lying quote costs a revert here rather than an under-funded launch.
+    ///      own floor, and the post-condition is re-read from the token.
+    ///
+    ///      THE SPOT QUOTE IS NOT A BOUND. A quote that makes the fee token look
+    ///      EXPENSIVE does not revert anything: it inflates `amountIn`, and the
+    ///      `need` floor is still met, so the strategy simply overspends. That is
+    ///      reachable by anyone, because `executeProposal` is permissionless (see
+    ///      `FeeAboveCap`). So the input is refused above the voted `maxFeeIn`:
+    ///      a manipulated price now costs the attacker a reverted execute, not
+    ///      the fund its launch budget.
     ///
     ///      No-ops when the strategy already holds enough — which is the common
     ///      case when the fee token IS the quote (a WETH-quoted Sushi launch),
@@ -803,6 +848,7 @@ contract LaunchpadStrategy is BaseStrategy {
 
         uint256 amountIn = Math.mulDiv(need, probe, out, Math.Rounding.Ceil);
         amountIn = Math.mulDiv(amountIn, BPS + settleSlippageBps, BPS);
+        if (amountIn > maxFeeIn) revert FeeAboveCap(amountIn, maxFeeIn);
         if (amountIn > probe) amountIn = probe;
 
         IERC20(quote_).forceApprove(address(swapAdapter), amountIn);
@@ -955,6 +1001,10 @@ contract LaunchpadStrategy is BaseStrategy {
         if (nowClock <= snap) revert SnapshotNotFinal(nowClock, snap);
 
         if (claimed[holder]) revert AlreadyClaimed(holder);
+        // Unreadable resolves to zero and blocks nobody: a vault with no queue
+        // has nothing to refuse.
+        address queue = _readAddress(vault(), abi.encodeCall(IVaultVotes.withdrawalQueue, ()));
+        if (queue != address(0) && holder == queue) revert QueueCannotClaim(queue);
 
         uint256 total = IVaultVotes(vault()).getPastTotalSupply(snap);
         if (total == 0) revert ZeroEntitlement(holder);

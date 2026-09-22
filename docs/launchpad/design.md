@@ -156,8 +156,19 @@ has to change at settlement. On v1 a fee that reaches a strategy after it
 settled has no way home except a later governance batch naming it to
 `rescueTo`. Naming the vault at launch removes that problem: fees never enter
 strategy custody, settlement makes no venue call, and anyone may push accrued
-fees with the adapter's permissionless `collectFees(launchRef)`. Fees arrive at
-the vault in kind and unpriced; a later proposal disposes of them.
+fees with the adapter's permissionless `collectFees(launchRef)`. Launch-token
+fees arrive in kind and unpriced; a later proposal disposes of them.
+
+**Fees in the vault asset are priced, and can be sniped.** When the launch is
+quoted in the vault asset (a WETH vault launching against WETH, a USDG vault
+against USDG), the quote-side fees raise `totalAssets` the moment they land.
+Fees accrue at the venue and arrive in a lump whenever anyone calls
+`collectFees`, and with no proposal open, deposits and redemptions are
+instant. So someone can deposit, trigger `collectFees`, and redeem with a
+pro-rata cut of fees earned while long-term holders carried the launch. The
+template cannot close this on v1, because collection is permissionless by
+design. Operators should collect often (a keeper), so no large lump is ever
+pending. Closed-deposit vaults are not exposed.
 
 On StonkBrokers the clone stays the creator (it needs `arm`/`abort`), so the
 clone forwards to its pinned `feeRecipient` rather than the venue paying the
@@ -183,11 +194,33 @@ move under the claim.
   snapshot would let the proposer freeze the claimant set before depositors can
   react to the public proposal.
 - **Queue-escrowed shares** at the snapshot belong to the withdrawal queue,
-  which never claims. That weight stays unclaimed and reaches the vault with the
+  which can only move the asset and shares. `claim`/`claimFor` refuse the queue
+  (`QueueCannotClaim`, read from `vault.withdrawalQueue()`), because
+  `claimFor` is permissionless and a slice paid to the queue would be stuck
+  there for good. That weight stays unclaimed and reaches the vault with the
   rest of the unclaimed reserve at settlement. It is not redistributed.
 - A claim in the execute block reverts with the template's own
   `SnapshotNotFinal`, not OZ's `ERC5805FutureLookup` from inside the vault.
 - `claimFor(holder)` is permissionless and pays the holder, never the caller.
+
+## Decision 4b: the launch fee has a voted cap
+
+The venue's native fee is read live, and on the third-token lane (the fee token
+is neither the vault asset nor the quote, e.g. a USDG vault paying Sushi's WETH
+fee) it is bought by swapping quote, sized from the swap adapter's spot quote.
+`executeProposal` is permissionless, so without a bound anyone could move the
+fee token's price in the route, execute, and unwind. A spot quote that makes the
+fee look expensive does not revert anything: it makes the strategy overspend,
+and the swap's floor (the fee amount) is still met. The pre-merge review
+reproduced a 1000e18 budget spending 945e18 on a 1e18 fee.
+
+`InitParams.maxFeeIn` is the voted bound: the most the fee may cost, in the
+token that pays for it (the vault asset when the fee token is the asset,
+otherwise the quote). The fee swap refuses an input above it, and the direct
+lanes refuse a fee above it, which also covers the venue owner repricing the
+fee between propose and execute. A manipulated price now costs the attacker a
+reverted execute, not the fund its budget. Zero is valid only for a venue that
+charges nothing (Stonk).
 
 ## Decision 5: settlement on v1 is all-or-revert
 

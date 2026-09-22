@@ -14,6 +14,7 @@ ffi = false
 fs_permissions = [
     { access = "read", path = "lib/sherwood-protocol/chains" },
     { access = "read", path = "script/launchpad" },
+    { access = "read", path = "script/lighter" },
 ]
 
 [profile.default.fmt]

@@ -1,0 +1,7 @@
+{
+  "name": "Robinhood Chain (Lighter venue constants)",
+  "chainId": 4663,
+  "ZK_LIGHTER": "0x94bAB9693Ba2f6358507eFfcbd372b0660AFfF9d",
+  "USDG": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+  "USDG_ASSET_INDEX": 3
+}

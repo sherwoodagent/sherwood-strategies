@@ -80,6 +80,7 @@ contract LaunchpadSushiV2ForkTest is Test {
                     claimWindow: CLAIM_WINDOW,
                     deadline: uint64(block.timestamp + 1 days),
                     settleSlippageBps: 100,
+                    maxFeeIn: 1e15,
                     name: "Sherwood Fork Fund",
                     symbol: "SFF",
                     venueData: ""

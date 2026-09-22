@@ -64,13 +64,17 @@ interface IPositionManagerFactory {
  *   `script/launchpad/addresses-4663.json`, with their identity evidence.
  *
  *   SUSHI IDENTITY. Before deploying the Sushi adapter the script asserts the
- *   launchpad is a V2 implementation and that its `v3Factory()` and
- *   `positionManager()` are the book's Sushi V3 pair AND that the position
- *   manager's own `factory()` names that factory. A code-length check passes
- *   on a squatted address; a graph a squatter would have to reproduce whole
- *   does not. The proxy is UUPS: record the printed implementation slot with
- *   the grant, because the codehash snapshot pins the PROXY's code, not the
- *   implementation behind it.
+ *   launchpad is V2.2 (`implementationVersion() == 2`, `implementationRevision()
+ *   == 2`, the revision the adapter was transcribed and fork-tested against),
+ *   that its `v3Factory()` and `positionManager()` are the book's Sushi V3 pair,
+ *   and that the position manager's own `factory()` names that factory.
+ *   STATED LIMIT: the book's V3 pair was first read from this launchpad, so the
+ *   round trip proves the graph is internally consistent, not that it is Sushi's.
+ *   The independent anchor is Sushi's published V3 contract list; check the
+ *   book against it when re-pinning. The proxy is UUPS: record the printed
+ *   implementation slot with the grant, because the codehash snapshot pins the
+ *   PROXY's code, not the implementation behind it, so a Sushi upgrade does not
+ *   show up in `isCounterpartyAllowed`.
  *
  *   Record the printed `padSetHash` with the grant: the codehash snapshot pins
  *   the Stonk adapter's CODE, and that hash is the only on-chain witness of the
@@ -184,6 +188,10 @@ contract DeployLaunchpadStrategy is Script {
         address positionManager = _launchpadAddress("SUSHI_V3_POSITION_MANAGER");
         ISushiLaunchpadV2 lp = ISushiLaunchpadV2(launchpad);
         require(lp.implementationVersion() == 2, "Sushi launchpad is not a V2 implementation");
+        // The adapter's vendored interface was transcribed from V2.2. A later
+        // revision may still be compatible, but it has to be re-checked (re-run
+        // the Sushi fork suite) before this ceremony vouches for it.
+        require(lp.implementationRevision() == 2, "Sushi launchpad is not V2.2: re-run the fork suite and re-pin");
         require(lp.v3Factory() == factory, "Sushi launchpad v3Factory() is not the book's Sushi V3 factory");
         require(
             lp.positionManager() == positionManager,

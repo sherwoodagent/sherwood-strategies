@@ -54,6 +54,14 @@ contract MockFundVault {
         governor = governor_;
     }
 
+    /// @dev The escrow v1's `SyndicateVault.withdrawalQueue()` names. Zero by
+    ///      default, which reads as "no queue".
+    address public withdrawalQueue;
+
+    function setWithdrawalQueue(address queue_) external {
+        withdrawalQueue = queue_;
+    }
+
     function isAgent(address) external pure returns (bool) {
         return true;
     }
@@ -331,6 +339,7 @@ contract LaunchpadStrategyTest is Test {
             claimWindow: CLAIM_WINDOW,
             deadline: uint64(block.timestamp + 1 days),
             settleSlippageBps: 500,
+            maxFeeIn: ASSET_IN,
             name: "Fund Token",
             symbol: "FUND",
             venueData: ""
@@ -862,6 +871,120 @@ contract LaunchpadStrategyTest is Test {
 
         assertEq(feeToken.balanceOf(address(launchAdapter)), fee);
         assertTrue(s.launchToken() != address(0));
+    }
+
+    // ── maxFeeIn: the voted bound on what the fee may cost ──
+
+    /// @dev The sandwich the bound exists for: someone moves the fee token's
+    ///      price in the route, then calls the permissionless execute. Both the
+    ///      spot quote and the swap read the moved price, so without the bound
+    ///      the strategy would size a ~1,050-unit swap for a 1-unit fee and the
+    ///      `need` floor would still be met. With it, execute reverts and no
+    ///      budget moves.
+    function test_execute_feeInThirdToken_movedPriceIsRefusedByTheCap() public {
+        RecordingSwapAdapter rec = _recorder();
+        launchAdapter.setNativeFee(address(feeToken), 1e18);
+        rec.setRate(address(quote), address(feeToken), 1e15); // fee token 1000x dearer
+
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.swapAdapter = address(rec);
+        p.minQuoteOut = 0;
+        p.maxFeeIn = 2e18;
+        LaunchpadStrategy s = _clone(p);
+
+        uint256 vaultBefore = asset.balanceOf(address(vault));
+        governor.setProposal(block.timestamp, DURATION);
+        vault.approveToken(address(asset), address(s), ASSET_IN);
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.FeeAboveCap.selector, 1050e18, 2e18));
+        vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+
+        assertEq(asset.balanceOf(address(vault)), vaultBefore, "no budget left the vault");
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Pending));
+    }
+
+    /// @dev The same tight cap admits an honest price: 1.05 units of quote
+    ///      (the fee plus `settleSlippageBps` headroom) for a 1-unit fee.
+    function test_execute_feeInThirdToken_honestPriceWithinTheCap() public {
+        RecordingSwapAdapter rec = _recorder();
+        launchAdapter.setNativeFee(address(feeToken), 1e18);
+
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.swapAdapter = address(rec);
+        p.minQuoteOut = 0;
+        p.maxFeeIn = 2e18;
+        LaunchpadStrategy s = _clone(p);
+        _execute(s);
+
+        (,, uint256 feeLegIn) = rec.swapAt(1);
+        assertEq(feeLegIn, 1.05e18, "fee leg spent the fee plus headroom, no more");
+        assertEq(feeToken.balanceOf(address(launchAdapter)), 1e18);
+    }
+
+    /// @dev A venue that reprices its fee between propose and execute (the
+    ///      venue owner front-running) is refused on the direct lanes too.
+    function test_execute_repricedFeeInVaultAsset_isRefusedByTheCap() public {
+        launchAdapter.setNativeFee(address(asset), 5e18);
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.maxFeeIn = 1e18;
+        LaunchpadStrategy s = _clone(p);
+
+        governor.setProposal(block.timestamp, DURATION);
+        vault.approveToken(address(asset), address(s), ASSET_IN);
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.FeeAboveCap.selector, 5e18, 1e18));
+        vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+    }
+
+    function test_execute_repricedFeeInQuote_isRefusedByTheCap() public {
+        launchAdapter.setNativeFee(address(quote), 5e18);
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.maxFeeIn = 1e18;
+        LaunchpadStrategy s = _clone(p);
+
+        governor.setProposal(block.timestamp, DURATION);
+        vault.approveToken(address(asset), address(s), ASSET_IN);
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.FeeAboveCap.selector, 5e18, 1e18));
+        vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+    }
+
+    /// @dev A venue that charges no fee needs no cap: Stonk launches with zero.
+    function test_execute_zeroCapIsFineWhenTheVenueChargesNothing() public {
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.maxFeeIn = 0;
+        LaunchpadStrategy s = _clone(p);
+        _execute(s);
+        assertTrue(s.launchToken() != address(0));
+    }
+
+    // ── the withdrawal queue cannot take a reserve slice ──
+
+    /// @dev The queue holds escrowed shares, so it has votes at the snapshot,
+    ///      but it can only move the asset and shares: launch tokens paid to it
+    ///      would be stuck. `claimFor` is permissionless, so it is refused, and
+    ///      the queue's slice reaches the vault at settle.
+    function test_claim_withdrawalQueueIsRefusedAndItsSliceReachesTheVault() public {
+        address queue = makeAddr("withdrawalQueue");
+        vault.setWithdrawalQueue(queue);
+        vault.setVotes(alice, 60e18);
+        vault.setVotes(queue, 40e18);
+
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        vm.warp(block.timestamp + 1);
+
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.QueueCannotClaim.selector, queue));
+        s.claimFor(queue);
+        vm.prank(queue);
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.QueueCannotClaim.selector, queue));
+        s.claim();
+
+        s.claimFor(alice);
+        address token = s.launchToken();
+        uint256 left = IERC20(token).balanceOf(address(s));
+
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+        assertEq(IERC20(token).balanceOf(queue), 0, "nothing stranded on the queue");
+        assertEq(IERC20(token).balanceOf(address(vault)), left, "the queue's slice reached the vault");
     }
 
     /// @dev The fee token IS the quote: already held after the quote leg, so no

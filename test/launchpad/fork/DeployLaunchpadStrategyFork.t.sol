@@ -354,6 +354,7 @@ contract DeployLaunchpadStrategyForkTest is Test {
             claimWindow: 7 days,
             deadline: uint64(block.timestamp + 1 days),
             settleSlippageBps: 500,
+            maxFeeIn: 0,
             name: "Fork Fund",
             symbol: "FORK",
             venueData: ""

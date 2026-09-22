@@ -1366,25 +1366,272 @@ contract LaunchpadStrategyTest is Test {
         assertEq(asset.balanceOf(address(vault)) - vaultBefore, 100e18);
     }
 
-    function test_settle_leavesQuoteInCustodyWhenSwapFails() public {
+    // ─────────────────────────────────────────────────────────────────────────
+    // settle is all-or-revert: the clone holds nothing afterwards
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev The clone's balance of every token it can hold. Settlement must
+    ///      leave all three at zero; v1 has no sweep to come back for them.
+    function _assertCloneEmpty(LaunchpadStrategy s) internal view {
+        assertEq(asset.balanceOf(address(s)), 0, "clone holds no vault asset");
+        assertEq(quote.balanceOf(address(s)), 0, "clone holds no quote");
+        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), 0, "clone holds no launch token");
+    }
+
+    /// @dev THE FAILED-CONVERSION PATH: an unquotable pair. The quote is NOT
+    ///      left behind as residue; it reaches the vault raw, and the skipped
+    ///      leg is announced.
+    function test_settle_unquotablePairPushesRawQuoteToVault() public {
         LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         quote.mint(address(s), 100e18);
         swapAdapter.setRate(address(quote), address(asset), 0); // unquotable
+        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
+        vm.warp(s.windowEnd() + 1);
+
+        vm.expectEmit(true, false, false, false, address(s));
+        emit LaunchpadStrategy.SettlementLegSkipped("quote");
+        _settle(s);
+
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled), "settlement completes");
+        assertEq(quote.balanceOf(address(vault)) - vaultQuoteBefore, 100e18, "raw quote delivered to the vault");
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev A quote that REVERTS (rather than answering zero) is the same
+    ///      failed conversion, and the same raw delivery.
+    function test_settle_revertingQuotePushesRawQuoteToVault() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        quote.mint(address(s), 100e18);
+        swapAdapter.setQuoteReverts(true);
+        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
         vm.warp(s.windowEnd() + 1);
         _settle(s);
 
-        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled), "settlement still completes");
-        assertEq(quote.balanceOf(address(s)), 100e18, "quote left as residue");
+        assertEq(quote.balanceOf(address(vault)) - vaultQuoteBefore, 100e18, "raw quote delivered");
+        _assertCloneEmpty(s);
     }
 
-    function test_settle_neverSellsTheFundToken() public {
+    /// @dev A quote of ZERO — a balance too small to price — is refused as a
+    ///      floor and delivered raw.
+    function test_settle_zeroQuotePushesRawQuoteToVault() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        quote.mint(address(s), 1);
+        swapAdapter.setRate(address(quote), address(asset), 1); // 1 wei * 1 / 1e18 == 0
+        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
+        vm.warp(s.windowEnd() + 1);
+
+        vm.expectEmit(true, false, false, false, address(s));
+        emit LaunchpadStrategy.SettlementLegSkipped("quote");
+        _settle(s);
+
+        assertEq(quote.balanceOf(address(vault)) - vaultQuoteBefore, 1, "the wei is delivered, not stranded");
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev The quote answers but the SWAP reverts (here: it fills below the
+    ///      slippage floor). Settlement still completes and the quote goes raw.
+    function test_settle_revertingSwapPushesRawQuoteToVault() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        quote.mint(address(s), 100e18);
+        swapAdapter.setFixedAmountOut(1); // far below the floor -> SlippageExceeded
+        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
+        uint256 vaultAssetBefore = asset.balanceOf(address(vault));
+        vm.warp(s.windowEnd() + 1);
+
+        vm.expectEmit(true, false, false, false, address(s));
+        emit LaunchpadStrategy.SettlementLegSkipped("settleSwap");
+        _settle(s);
+
+        assertEq(quote.balanceOf(address(vault)) - vaultQuoteBefore, 100e18, "raw quote delivered");
+        assertEq(asset.balanceOf(address(vault)), vaultAssetBefore, "no asset arrived from a failed swap");
+        assertEq(quote.allowance(address(s), address(swapAdapter)), 0, "no standing approval after a failed swap");
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev A swap that SUCCEEDS but pulls less than it was offered leaves a
+    ///      remainder; that remainder is delivered raw rather than stranded.
+    function test_settle_partialFillRemainderPushedRaw() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        quote.mint(address(s), 100e18);
+        swapAdapter.setPullBps(6_000); // pulls 60, pays for 100
+        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
+        uint256 vaultAssetBefore = asset.balanceOf(address(vault));
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(asset.balanceOf(address(vault)) - vaultAssetBefore, 100e18, "the converted leg arrived as asset");
+        assertEq(quote.balanceOf(address(vault)) - vaultQuoteBefore, 40e18, "the unpulled remainder arrived raw");
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev THE UNCLAIMED RESERVE goes to the vault in kind — and is NEVER
+    ///      sold. No swap is attempted on the launch token (the mock has no
+    ///      rate for it, so any attempt would have reverted settlement).
+    function test_settle_pushesUnclaimedReserveInKindAndNeverSellsIt() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        uint256 swapsBefore = swapAdapter.swapCalls();
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(IERC20(s.launchToken()).balanceOf(address(vault)), RESERVE, "whole reserve delivered in kind");
+        assertEq(
+            swapAdapter.swapCalls(), swapsBefore, "no swap at settlement: nothing to convert, fund token never sold"
+        );
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev Partial claims: the vault receives exactly the unclaimed
+    ///      remainder, and the holders keep what they claimed.
+    function test_settle_afterPartialClaims_vaultGetsExactlyTheRemainder() public {
+        LaunchpadStrategy s = _executedWithHolders();
+        IERC20 token = IERC20(s.launchToken());
+        vm.prank(alice);
+        s.claim();
+        vm.prank(carol);
+        s.claim();
+        uint256 unclaimed = RESERVE - s.totalClaimed();
+        assertEq(unclaimed, (RESERVE * 3) / 10, "bob's slice is the remainder");
+
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(token.balanceOf(address(vault)), unclaimed, "vault received the unclaimed remainder");
+        assertEq(token.balanceOf(alice), RESERVE / 2, "claims are untouched by settlement");
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev NOTHING IS CLAIMABLE AFTER SETTLEMENT, which is what makes pushing
+    ///      the reserve safe. The late holder is refused `NotClaimable`, and
+    ///      `claimable` reads zero.
+    function test_settle_noClaimAfterSettlement() public {
+        LaunchpadStrategy s = _executedWithHolders();
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(s.claimable(bob), 0, "claimable reads zero once settled");
+        vm.prank(bob);
+        vm.expectRevert(LaunchpadStrategy.NotClaimable.selector);
+        s.claim();
+    }
+
+    /// @dev The backstop path: a corrupt decode left `windowEnd` past
+    ///      `anyoneSettleAt`, so settlement opens while the window still reads
+    ///      open. It must still empty the clone, and it cuts the window short:
+    ///      no claim can follow it.
+    function test_settle_backstopPathStillEmptiesTheCloneAndEndsClaims() public {
+        LaunchpadStrategy s = _executedWithHolders();
+        stdstore.target(address(s)).sig("windowEnd()").checked_write(type(uint256).max);
+
+        vm.warp(s.anyoneSettleAt());
+        _settle(s);
+
+        assertEq(IERC20(s.launchToken()).balanceOf(address(vault)), RESERVE, "reserve delivered in kind");
+        _assertCloneEmpty(s);
+        vm.prank(alice);
+        vm.expectRevert(LaunchpadStrategy.NotClaimable.selector);
+        s.claim();
+    }
+
+    /// @dev Quote == asset: there is no conversion leg and no raw-quote leg,
+    ///      and the clone still ends empty.
+    function test_settle_quoteEqualsAsset_cloneEmpty() public {
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.quoteToken = address(asset);
+        p.minQuoteOut = 0;
+        LaunchpadStrategy s = _clone(p);
+        _execute(s);
+        asset.mint(address(s), 5e18); // unspent budget, say
+        uint256 vaultBefore = asset.balanceOf(address(vault));
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(asset.balanceOf(address(vault)) - vaultBefore, 5e18);
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev The event reports what reached the vault, per token, in that
+    ///      token's own units.
+    function test_settle_eventReportsEachDelivery() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        asset.mint(address(s), 7e18);
+        quote.mint(address(s), 3e18);
+        swapAdapter.setRate(address(quote), address(asset), 0); // quote goes raw
+        vm.warp(s.windowEnd() + 1);
+
+        vm.expectEmit(false, false, false, true, address(s));
+        emit LaunchpadStrategy.FundSettled(7e18, RESERVE, 3e18);
+        _settle(s);
+    }
+
+    /// @dev ALL-OR-REVERT, the revert half: a token that refuses to move fails
+    ///      settlement rather than being read as zero and left on the clone.
+    ///      The whole call reverts, so the clone is still `Executed` and a
+    ///      retry is possible once the token moves again.
+    function test_settle_revertsWhenATokenRefusesToMove() public {
         LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
+        address token = s.launchToken();
+        vm.mockCallRevert(token, abi.encodeWithSelector(IERC20.transfer.selector), "frozen");
+
+        vm.expectRevert(bytes("frozen"));
         _settle(s);
-        // The whole unclaimed reserve is still here — no route existed for it
-        // and none was invented.
-        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), RESERVE);
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Executed), "nothing half-settled");
+
+        vm.clearMockedCalls();
+        _settle(s);
+        _assertCloneEmpty(s);
+    }
+
+    /// @dev THE ACCEPTED P&L. v1 books settle P&L as the vault-asset balance
+    ///      delta; with the whole budget spent on the launch, the vault is
+    ///      down exactly `ASSET_IN` in the asset, and holds the unclaimed
+    ///      reserve unpriced. That is the loss voters size `maxDrawdownBps`
+    ///      for.
+    function test_settle_vaultAssetDeltaIsMinusTheQuoteSpent() public {
+        LaunchpadStrategy s = _cloneDefault();
+        uint256 vaultBefore = asset.balanceOf(address(vault));
+        _execute(s);
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(vaultBefore - asset.balanceOf(address(vault)), launchAdapter.lastQuoteIn(), "loss == quote spent");
+        assertEq(launchAdapter.lastQuoteIn(), ASSET_IN, "at a 1:1 quote leg the whole budget was spent");
+    }
+
+    /// @dev Whatever subset of holders claims, and whichever way the
+    ///      conversion goes, settlement leaves the clone empty and the vault
+    ///      holds exactly the unclaimed reserve.
+    function testFuzz_settle_cloneAlwaysEmpty(uint8 claimMask, uint8 mode, uint96 leftoverQuote) public {
+        LaunchpadStrategy s = _executedWithHolders();
+        address[3] memory holders = [alice, bob, carol];
+        for (uint256 i; i < 3; ++i) {
+            if (claimMask & (1 << i) != 0) {
+                vm.prank(holders[i]);
+                s.claim();
+            }
+        }
+        quote.mint(address(s), leftoverQuote);
+        mode = mode % 4;
+        if (mode == 1) swapAdapter.setRate(address(quote), address(asset), 0);
+        if (mode == 2) swapAdapter.setQuoteReverts(true);
+        if (mode == 3) swapAdapter.setPullBps(5_000);
+
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        _assertCloneEmpty(s);
+        assertEq(
+            IERC20(s.launchToken()).balanceOf(address(vault)),
+            RESERVE - s.totalClaimed(),
+            "vault holds exactly the unclaimed reserve"
+        );
     }
 }

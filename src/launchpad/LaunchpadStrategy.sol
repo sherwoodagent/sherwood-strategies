@@ -138,10 +138,10 @@ contract LaunchpadStrategy is BaseStrategy {
     ///         `ConcentratedLiquidityStrategy.MAX_SLIPPAGE_BPS`.
     /// @dev    The floor of `!= 0` matters as much as the ceiling: a zero
     ///         tolerance would make the settle-time quote conversion revert on
-    ///         any real venue, and this template answers that by LEAVING THE
-    ///         QUOTE AS RESIDUE rather than reverting — so a zero tolerance
-    ///         would silently convert every settlement into a residue
-    ///         settlement.
+    ///         any real venue, and this template answers that by DELIVERING
+    ///         THE RAW QUOTE to the vault rather than reverting — so a zero
+    ///         tolerance would silently turn every settlement into an in-kind
+    ///         one, booked as a loss of everything the quote was worth.
     uint256 public constant MAX_SLIPPAGE_BPS = 1_000;
 
     uint256 private constant BPS = 10_000;
@@ -265,10 +265,11 @@ contract LaunchpadStrategy is BaseStrategy {
     error NotClaimable();
 
     /// @notice A claim arrived after `windowEnd`.
-    /// @dev    The unclaimed remainder is settlement inventory, warehoused
-    ///         unpriced at the vault — never redistributed to the holders who
-    ///         did claim, which would make the last claimant's share depend on
-    ///         when everyone else showed up.
+    /// @dev    The unclaimed remainder goes to the vault in kind at settlement,
+    ///         where it sits unpriced until a later proposal disposes of it —
+    ///         never redistributed to the holders who did claim, which would
+    ///         make the last claimant's share depend on when everyone else
+    ///         showed up.
     error ClaimWindowClosed(uint256 nowTs, uint256 windowEnd);
 
     /// @notice A claim landed at `clock() <= snap`, i.e. in the execute block.
@@ -340,14 +341,17 @@ contract LaunchpadStrategy is BaseStrategy {
     /// @notice `holder` took their pro-rata slice of the reserve.
     event ReserveClaimed(address indexed holder, uint256 amount, uint256 totalClaimed);
 
-    /// @notice Settlement finished. `assetDelivered` is what reached the vault
-    ///         in vault-asset units; the other two are what stayed behind as
-    ///         residue.
-    event FundSettled(uint256 assetDelivered, uint256 tokenResidue, uint256 quoteResidue);
+    /// @notice Settlement finished and the clone is empty. Every figure is
+    ///         what reached the vault, in that token's own units:
+    ///         `assetDelivered` in the vault asset, `tokenDelivered` the
+    ///         unclaimed launch reserve in kind, `quoteDelivered` the quote the
+    ///         conversion could not sell, in kind. Only `assetDelivered` counts
+    ///         toward the proposal's P&L.
+    event FundSettled(uint256 assetDelivered, uint256 tokenDelivered, uint256 quoteDelivered);
 
-    /// @notice A settle-time leg that is allowed to fail did fail. Loud on
-    ///         purpose: settlement completing is not the same as settlement
-    ///         being complete.
+    /// @notice The settle-time quote conversion did not happen, so the quote
+    ///         goes to the vault in kind instead. Loud on purpose: a settlement
+    ///         that delivers raw quote books that quote's whole value as loss.
     event SettlementLegSkipped(bytes32 indexed leg);
 
     /// @notice The fee-swap OVERSHOOT — fee token bought but not pulled by the
@@ -977,16 +981,51 @@ contract LaunchpadStrategy is BaseStrategy {
     ///      that reorders that struct poisons both. `MAX_CLAIM_WINDOW` is what
     ///      actually contains that case.
     ///
+    ///      ALL-OR-REVERT: WHEN THIS RETURNS, THE CLONE HOLDS NOTHING. v1 has
+    ///      no post-settlement sweep and no residue accounting — a balance
+    ///      left here after `settle()` is recoverable only by a vault batch
+    ///      that names it to `rescueTo`, i.e. by a later governance act. So
+    ///      every token this clone can hold leaves in this call, or the call
+    ///      reverts:
+    ///        1. the quote is converted to the vault asset if that can be done
+    ///           honestly (`_convertQuote`), and otherwise stays quote;
+    ///        2. the vault asset is pushed;
+    ///        3. whatever quote is left — an unquotable pair, a reverting
+    ///           swap, a partial fill — is pushed RAW;
+    ///        4. whatever launch token is left — the unclaimed reserve — is
+    ///           pushed in kind.
+    ///      Every push is a `safeTransfer` of the live balance, so a token that
+    ///      refuses to move reverts settlement instead of silently staying.
+    ///      The fee-swap overshoot is not in this list because `_execute`
+    ///      already delivered it (`_deliverFeeTokenResidue`), and creator fees
+    ///      are not in it because they never arrive here (see below).
+    ///
+    ///      NOTHING CAN BE CLAIMED AFTER THIS RUNS, which is what makes step 4
+    ///      safe rather than a theft from late claimants. `_claim` requires
+    ///      `Executed` and `BaseStrategy.settle` has already moved the state to
+    ///      `Settled` before calling this hook; on the ordinary path the window
+    ///      closed before this gate opened anyway. On the backstop path (a
+    ///      corrupt decode left `windowEnd` past `anyoneSettleAt`) the window is
+    ///      cut short at settlement — the same truncation the clamp exists to
+    ///      make, only later.
+    ///
+    ///      THE P&L CONSEQUENCE IS ACCEPTED, NOT HIDDEN. The governor books
+    ///      settle P&L as the vault-asset balance delta, so only step 2 counts;
+    ///      the quote the launch spent, any raw quote from step 3, and the
+    ///      reserve from step 4 all read as loss. Voters size the proposal's
+    ///      `maxDrawdownBps` to that, or the governor's settle-price floor
+    ///      refuses the settlement (and only the owner's emergency path, with
+    ///      its wider floor, can finish it).
+    ///
     ///      IT MAKES NO VENUE CALL AT ALL, and that is the simplification the
-    ///      vault-direct fee routing bought. There is no fee to sweep here (the
-    ///      venue has been paying `vault()` since the launch block) and no
-    ///      creator role to hand over (the vault has held it since the launch
-    ///      block), so the two tolerated-failure venue legs this hook used to
-    ///      carry are gone rather than merely defended: settlement can no
-    ///      longer be made to skip a leg by a paused pad, a reverting
-    ///      `collectFees`, or a venue with no transfer entry point, because it
-    ///      no longer asks a venue for anything. What remains is arithmetic on
-    ///      balances this clone already holds.
+    ///      vault-direct fee routing bought. There is no fee to collect here
+    ///      (the venue has been paying `vault()` since the launch block) and no
+    ///      creator role to hand over (the vault has held the fee stream since
+    ///      the launch block), so settlement cannot be made to fail by a
+    ///      paused pad, a reverting `collectFees`, or a venue with no transfer
+    ///      entry point, because it never asks a venue for anything. What
+    ///      remains is arithmetic on balances this clone already holds, plus
+    ///      the one tolerated swap.
     ///
     ///      Anyone who wants accrued fees pushed calls the ADAPTER's
     ///      `collectFees(launchRef)` directly — permissionless, paying the
@@ -995,40 +1034,52 @@ contract LaunchpadStrategy is BaseStrategy {
     ///      IT NEVER SELLS THE FUND TOKEN. Not into its own launch pool, not
     ///      anywhere — that price is attacker-movable inside this very
     ///      transaction, which is the finding-#3 shape verbatim. The fund token
-    ///      leaves only as a claim, or as unpriced inventory via `sweep()`.
+    ///      leaves only as a claim, or in kind to the vault.
     ///
     ///      THE REGISTRY IS NEVER CONSULTED HERE. `_execute` re-checks
     ///      because blocking it strands nothing; gating the EXIT would hand a
-    ///      demotion — or a merely unreachable registry — the power to freeze
-    ///      deployed capital.
+    ///      de-listing — or a merely unreachable registry — the power to
+    ///      freeze deployed capital.
     function _settle() internal override {
         if (block.timestamp <= windowEnd && block.timestamp < anyoneSettleAt) {
             revert ClaimWindowStillOpen(block.timestamp, windowEnd, anyoneSettleAt);
         }
 
-        // ── convert quote -> vault asset, or leave it as declared residue
+        address asset_ = asset;
         address quote_ = quoteToken;
-        if (quote_ != asset) _convertQuote(quote_);
+        address token = launchToken;
 
-        uint256 delivered = IERC20(asset).balanceOf(address(this));
-        _pushAllToVault(asset);
+        // 1 ── convert what can be converted honestly; tolerated failure
+        if (quote_ != asset_) _convertQuote(quote_);
 
-        emit FundSettled(
-            delivered,
-            launchToken == address(0) ? 0 : _safeBalance(launchToken),
-            quote_ == asset ? 0 : _safeBalance(quote_)
-        );
+        // 2 ── the vault asset
+        uint256 assetDelivered = _pushBalance(asset_);
+
+        // 3 ── the quote the conversion could not sell, raw
+        uint256 quoteDelivered = quote_ == asset_ ? 0 : _pushBalance(quote_);
+
+        // 4 ── the unclaimed reserve, in kind. `launchToken` is set by every
+        //      successful execute, and `settle()` requires one.
+        uint256 tokenDelivered = _pushBalance(token);
+
+        emit FundSettled(assetDelivered, tokenDelivered, quoteDelivered);
     }
 
-    /// @dev A FAILED OR UNQUOTABLE CONVERSION IS RESIDUE, NOT A REVERT. The
-    ///      floor is derived from the adapter's own forward quote discounted by
-    ///      `settleSlippageBps`; a quote that cannot be read, a quote of zero,
-    ///      or a swap that reverts all leave the quote token in custody, where
-    ///      `undeliveredValue()`/`hasUnvaluedResidue()` declare it and `sweep()`
-    ///      warehouses it. Deliverable maximum: settle what is expressible,
-    ///      declare the rest.
+    /// @dev A FAILED OR UNQUOTABLE CONVERSION IS NOT A REVERT — it is a raw
+    ///      delivery. The floor is derived from the adapter's own forward
+    ///      quote discounted by `settleSlippageBps`; a quote that cannot be
+    ///      read, a quote of zero, or a swap that reverts all leave the quote
+    ///      token here for `_settle` to push to the vault as-is. Reverting
+    ///      instead would let an unquotable pair wedge settlement — and with
+    ///      it `openProposalCount() != 0`, which locks the vault — over a
+    ///      token the vault can hold perfectly well.
+    ///
+    ///      Both calls are raw so that nothing the swap adapter does — revert,
+    ///      short return — can abort settlement from here. The swap adapter
+    ///      was a vetted counterparty at execute; it is not re-checked here,
+    ///      for the reason `_settle` gives.
     function _convertQuote(address quote_) private {
-        uint256 bal = _safeBalance(quote_);
+        uint256 bal = IERC20(quote_).balanceOf(address(this));
         if (bal == 0) return;
 
         // solhint-disable-next-line avoid-low-level-calls
@@ -1053,22 +1104,16 @@ contract LaunchpadStrategy is BaseStrategy {
         if (!sOk) emit SettlementLegSkipped("settleSwap");
     }
 
-    // ── Reads that must not revert ──
-
-    /// @dev `balanceOf(address(this))` through a length-checked staticcall.
-    ///      A token that reverts, returns short, or has no code resolves to 0
-    ///      rather than bricking a probe the vault reads under a gas cap and
-    ///      treats as "no residue" on failure.
-    function _safeBalance(address token) private view returns (uint256) {
-        if (token.code.length == 0) return 0;
-        (bool ok, bytes memory ret) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
-        if (!ok || ret.length < 32) return 0;
-        uint256 word;
-        assembly ("memory-safe") {
-            word := mload(add(ret, 0x20))
-        }
-        return word;
+    /// @dev Push this clone's whole balance of `token` to the vault and return
+    ///      the amount. Typed and reverting on purpose: in an all-or-revert
+    ///      settlement, a token that will not move must fail the call, not be
+    ///      read as zero and left behind.
+    function _pushBalance(address token) private returns (uint256 amount) {
+        amount = IERC20(token).balanceOf(address(this));
+        if (amount != 0) _pushToVault(token, amount);
     }
+
+    // ── The vault clock ──
 
     /// @dev The vault's ERC-5805 clock, REQUIRED rather than inferred. A
     ///      length-checked staticcall whose failure is a named revert — see

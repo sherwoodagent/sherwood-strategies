@@ -524,6 +524,12 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///         is the single legitimate inbound payment. A `selfdestruct`
     ///         force-send cannot be refused, and needs no handling: nothing reads
     ///         a native balance here, and a stranded wei belongs to no fund.
+    /// @dev    On a clone this runs behind the ERC-1167 DELEGATECALL, which a
+    ///         2300-gas `transfer` stipend could not always afford. Robinhood's
+    ///         WETH is Arbitrum's `aeWETH` (`0x0Bd7…AD73`, impl `0xc6b8…947e`),
+    ///         whose `withdrawTo` pays with a full-gas `call`, so the unwrap is
+    ///         not stipend-bound. A deployment on a chain whose WETH uses
+    ///         `transfer` must re-check this.
     receive() external payable {
         if (msg.sender != weth) revert UnexpectedNativePayment(msg.sender);
     }

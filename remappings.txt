@@ -1,0 +1,4 @@
+@sherwood/=lib/sherwood-protocol/src/
+@openzeppelin/contracts/=lib/sherwood-protocol/lib/openzeppelin-contracts/contracts/
+@openzeppelin/contracts-upgradeable/=lib/sherwood-protocol/lib/openzeppelin-contracts-upgradeable/contracts/
+forge-std/=lib/sherwood-protocol/lib/forge-std/src/

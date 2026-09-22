@@ -1,0 +1,25 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+# Match sherwood-protocol so the protocol sources this repo compiles (BaseStrategy,
+# interfaces) build byte-for-byte the way they do upstream.
+solc = "0.8.28"
+optimizer = true
+optimizer_runs = 50
+via_ir = true
+ffi = false
+fs_permissions = [{ access = "read", path = "lib/sherwood-protocol/chains" }]
+
+[profile.default.fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+
+[lint]
+exclude_lints = ["screaming-snake-case-immutable", "mixed-case-variable"]
+
+[rpc_endpoints]
+robinhood = "${ROBINHOOD_RPC_URL}"

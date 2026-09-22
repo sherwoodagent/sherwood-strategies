@@ -57,12 +57,12 @@ interface ILaunchAdapter {
     ///                      reason this member exists. Routing fees through the
     ///                      strategy and forwarding them onward gave the fee
     ///                      stream a destination that had to CHANGE when the
-    ///                      strategy settled — and while a settled strategy
-    ///                      holds fee tokens, anyone can drive the vault's
-    ///                      permissionless residue collection and re-stamp a
-    ///                      fresh deposit lock on the whole vault. Naming the
-    ///                      vault up front deletes that lever rather than
-    ///                      guarding it: fees never enter strategy custody in
+    ///                      strategy settled — and a fee that reaches a
+    ///                      strategy after it settled has no way home except a
+    ///                      later governance batch naming it to `rescueTo`.
+    ///                      Naming the vault up front deletes that problem
+    ///                      rather than guarding it: fees never enter strategy
+    ///                      custody in
     ///                      the first place, so there is no lane to get wrong,
     ///                      no handoff to fail at settlement, and no
     ///                      settlement-dependent branch to reason about.

@@ -437,10 +437,18 @@ value behind that the governor's P&L has already booked as lost.
 `BaseStrategy.rescueTo(token)` is `onlyVault`, not `virtual`, and moves a balance without a
 hook this template could observe, so it is **not** counted. The consequence: a vault batch
 that rescues USDG off the clone **before** `settle()` shrinks `accounted` by what it moved,
-and the settle guard then reads that as a shortfall. That is not a brick —
-`acknowledgeShortfall()` lets settlement through, and nothing is lost because the rescued
-USDG is already in the vault. `test_v1_rescueBeforeSettle_readsAsShortfall_waiverUnblocks`
-pins it.
+and the settle guard then reads that as a shortfall. When the rescue and the settle run in
+**separate transactions** that is not a brick — `acknowledgeShortfall()` lets settlement
+through, and nothing is lost because the rescued USDG is already in the vault.
+`test_v1_rescueBeforeSettle_readsAsShortfall_waiverUnblocks` pins it.
+
+**Never put `rescueTo(USDG)` ahead of `settle()` in the same batch.** Inside that batch
+`accounted` reads the rescued USDG as missing and settle reverts `WithdrawalInFlight`;
+outside it everything has arrived, so `acknowledgeShortfall()` reverts `NoShortfall`; and
+`unstick` replays the same failing calls. Only the owner's `emergencySettleWithCalls` gets
+out. A pre-settle rescue is never needed — `_settle` claims matured pending USDG itself and
+pushes the whole balance — so a proposal's settlement calls are `[settle()]`, and
+`[recoverResiduals(), rescueTo(USDG)]` belongs **after** settle only.
 
 ### The settle guard cannot brick the vault
 
@@ -535,6 +543,26 @@ Governor batches only run while a proposal is open, when deposits are shut. **Th
 governor measures P&L as the vault's asset delta across a proposal, so a tranche rescued inside
 a *later* proposal's batch is booked as that proposal's profit and pays its performance fee.
 Queue the true balance before settling whenever possible.
+
+**The batch protects the push, not the whole window.** Between this clone's settle and the next
+proposal's Draft, deposits are open while the unrecovered margin is public on-chain
+(`getPendingBalance`, the clone's USDG balance). v1's deposit lock reads only
+`openProposalCount()` — `post-audit`'s `hasUnvaluedResidue` gate that shut deposits while a
+settled clone still had value out was deleted with the rest of the residue machinery. Anyone
+who deposits in that window takes a pro-rata share of the tranche when it lands. The template
+cannot close this on v1, so it is an operating requirement:
+
+1. **Queue the true balance before settling** (`queue-withdraw --all`), so nothing is left to
+   recover.
+2. If something is left, **propose the recovery immediately**, or use the owner's emergency
+   path, to keep the open-deposit window short.
+
+**Rotate the agent key before settling.** `guardrailAction` and `updateParams` only work
+while the clone is `Executed`, so after settle nobody can cancel orders, close a market or
+rotate the key. The registered agent key stays live at Lighter and could keep trading any
+residual margin, including re-opening positions that would then block the `queueWithdraw`
+recovery path. Rotate it to a burn key (`guardrailAction` with `ACTION_ROTATE_KEY`) as the last step
+before `settle()`.
 
 ## Events & errors
 

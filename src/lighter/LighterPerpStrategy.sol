@@ -141,8 +141,17 @@ contract LighterPerpStrategy is BaseStrategy {
     ///         this template could observe. A vault batch that rescues USDG off
     ///         this clone BEFORE `settle()` therefore shrinks `accounted` by what
     ///         it moved; the settle guard then reads that as a shortfall and
-    ///         `acknowledgeShortfall()` is the way through. Nothing is lost —
-    ///         the rescued USDG is already in the vault.
+    ///         `acknowledgeShortfall()` is the way through — but ONLY when the
+    ///         rescue and the settle run in separate transactions.
+    ///
+    ///         NEVER PUT `rescueTo(USDG)` AHEAD OF `settle()` IN ONE BATCH. Inside
+    ///         that batch `accounted` reads the rescued amount as missing, so
+    ///         settle reverts `WithdrawalInFlight`; outside it everything has
+    ///         arrived, so `acknowledgeShortfall()` reverts `NoShortfall`; and
+    ///         `unstick` replays the same calls. Only the owner's emergency settle
+    ///         gets out. A pre-settle rescue is never needed: `_settle` claims the
+    ///         matured pending balance itself and pushes the whole USDG balance.
+    ///         `[recoverResiduals(), rescueTo(USDG)]` is for AFTER settle.
     uint256 public returnedAssets;
     /// @notice Proposer/vault-owner assertion that settling below `queuedTicks`
     ///         is intended (venue under-fill / write-off). Settle's escape hatch.
@@ -653,7 +662,15 @@ contract LighterPerpStrategy is BaseStrategy {
     ///         belonged to the LPs who carried the loss. `BaseStrategy.rescueTo`
     ///         is `onlyVault`, so the push happens inside a governor batch, and
     ///         batches only run while a proposal is open — when deposits are
-    ///         shut. The removed `onlyVault` `sweep()` did the claim and the push
+    ///         shut. That protects the PUSH, not the whole window: between this
+    ///         clone's settle and the next proposal's Draft, deposits are open
+    ///         while the unrecovered margin is visible on-chain
+    ///         (`getPendingBalance`, the clone's USDG balance), and v1's deposit
+    ///         lock reads only `openProposalCount()`. Anyone depositing in that
+    ///         window shares the late tranche when it lands. The template cannot
+    ///         close that on v1; operators must propose the recovery promptly (or
+    ///         use the owner's emergency path) and should queue the true balance
+    ///         before settling so there is nothing to recover. The removed `onlyVault` `sweep()` did the claim and the push
     ///         in one call for `post-audit`'s `collectResidue`; v1 has no such
     ///         dispatcher, and a batch can carry `[recoverResiduals(),
     ///         rescueTo(USDG)]` against this clone to get the same effect. The

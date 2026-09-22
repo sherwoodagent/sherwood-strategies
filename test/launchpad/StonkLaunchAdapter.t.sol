@@ -10,7 +10,7 @@ import {MockStonkPad} from "../mocks/MockStonkPad.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @notice Stands in for `TokenizeFundStrategy`: the `launch` caller, the clone
+/// @notice Stands in for `LaunchpadStrategy`: the `launch` caller, the clone
 ///         owner, and the address the custody invariant says must end up
 ///         holding the reserve.
 /// @dev It still exposes `state()` and `vault()`, but the adapter no longer
@@ -769,10 +769,9 @@ contract StonkLaunchAdapterTest is Test {
     ///      `test_CollectFees_PostSettlementPaysTheVault...`, which existed to
     ///      pin a destination SWITCH there is no longer any code for.
     ///
-    ///      The lock lever those tests guarded is gone rather than guarded:
-    ///      value never lands in strategy custody in any phase, so there is no
-    ///      arrival for a permissionless `SyndicateVault.collectResidue` to
-    ///      convert into a fresh 7-day deposit lock.
+    ///      The problem those tests guarded is gone rather than guarded: value
+    ///      never lands in strategy custody in any phase, so no fee can arrive
+    ///      on a strategy that has already settled and handed everything back.
     function test_CollectFees_SameDestinationWhetherTheOwnerIsLiveOrSettled() public {
         ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
@@ -1056,11 +1055,10 @@ contract StonkLaunchAdapterTest is Test {
     }
 
     function test_LaunchTargetZeroMeansSettlementSkipsTheCreatorHandoff() public view {
-        // `TokenizeFundStrategy._settle` only calls `transferCreator` when
-        // `launchTarget()` is nonzero; this venue has no such selector, and it
-        // needs none — the clone has been forwarding to the launch's
-        // `feeRecipient` since the first block, so settlement has no fee lane
-        // left to open.
+        // No consumer calls a creator handoff on `launchTarget()`: this venue
+        // has no such selector, and it needs none — the clone has been
+        // forwarding to the launch's `feeRecipient` since the first block, so
+        // settlement has no fee lane left to open.
         assertEq(adapter.launchTarget(), address(0));
     }
 

@@ -169,33 +169,3 @@ contract MockLaunchAdapter is ILaunchAdapter {
         return target;
     }
 }
-
-/// @notice A venue that implements Sushi's transferable creator role.
-contract MockCreatorVenue {
-    address public lastToken;
-    address public lastCreator;
-    uint256 public calls;
-
-    function transferCreator(address token, address newCreator) external {
-        lastToken = token;
-        lastCreator = newCreator;
-        calls++;
-    }
-}
-
-/// @notice A venue whose `transferCreator` reverts — the tolerated-failure leg.
-contract MockRevertingCreatorVenue {
-    error CreatorTransferBroken();
-
-    function transferCreator(address, address) external pure {
-        revert CreatorTransferBroken();
-    }
-}
-
-/// @notice A venue with NO `transferCreator` selector at all (StonkBrokers
-///         shape). The strategy's fixed-selector call simply no-ops.
-contract MockNoCreatorVenue {
-    function ping() external pure returns (uint256) {
-        return 1;
-    }
-}

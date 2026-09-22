@@ -26,12 +26,12 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
  *
  *   ONE CONTRACT, TWO ROLES. The implementation IS the clone logic;
  *   `Clones.clone(implementation)` mints instances of this same code.
- *     - IMPLEMENTATION ROLE (the address `TierRegistry` allowlists and
- *       certifies): `launch`, `phase`, `finalize`, `collectFees`,
+ *     - IMPLEMENTATION ROLE (the address `TierRegistry` allowlists as a
+ *       counterparty): `launch`, `phase`, `finalize`, `collectFees`,
  *       `quoteSupported`, `nativeFeeSource`, `launchTarget`, `lanes`. Its
  *       constructor writes the lane -> pad map and then LOCKS ITS OWN
  *       INITIALIZER (`BaseStrategy`'s template-lock precedent), so nobody can
- *       initialize the implementation itself and turn the certified address
+ *       initialize the implementation itself and turn the allowlisted address
  *       into somebody's clone.
  *     - CLONE ROLE (owned by one strategy): `initialize`, `executeLaunch`,
  *       `clonePhase`, `cloneFinalize`, `cloneCollectFees`, `abort`.
@@ -47,18 +47,19 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
  *   at `initialize` rather than looking one up.
  *
  *   THE PAD SET IS IMMUTABLE CONFIGURATION, AND `padSetHash` IS HOW THAT IS
- *   PROVED. `setAdapterAllowed` snapshots the implementation's CODEHASH, and a
- *   codehash cannot see storage at all — so a mutable lane map would be a
- *   routing lever living entirely outside the gate, able to redirect every
- *   future launch to an uncertified venue without changing anything the gate
- *   can observe. There is therefore no setter, anywhere, at any access level.
- *   "No setter exists" is still a claim a certifier would have to establish by
- *   reading the code, so the implementation also exposes an IMMUTABLE
+ *   PROVED. `TierRegistry.setCounterpartyAllowed` snapshots the
+ *   implementation's CODEHASH at grant, and a codehash cannot see storage at
+ *   all — so a mutable lane map would be a routing lever living entirely
+ *   outside the gate, able to redirect every future launch to an unvetted
+ *   venue without changing anything the gate can observe. There is therefore
+ *   no setter, anywhere, at any access level. "No setter exists" is still a
+ *   claim a reviewer would have to establish by reading the code, so the
+ *   implementation also exposes an IMMUTABLE
  *   `padSetHash = keccak256(abi.encode(quotes, pads))` over the ordered pairs
  *   it was constructed with: the codehash pins the code, the pad-set hash pins
- *   the configuration that code was certified against, and `lanes()` returns
+ *   the configuration that code was allowlisted with, and `lanes()` returns
  *   the arrays to hash. Serving a new lane means a new implementation and a
- *   fresh certification.
+ *   fresh grant.
  *
  *   WHERE FEES GO: `feeRecipient`, PINNED AT `initialize` FROM THE LAUNCH.
  *   This venue pins the creator too, and the creator has to stay the clone —
@@ -177,8 +178,9 @@ contract StonkLaunchAdapter is ILaunchAdapter {
 
     /// @notice `keccak256(abi.encode(quotes, pads))` over the ordered lane set
     ///         this implementation was constructed with.
-    /// @dev See the contract header: this is what makes the certified lane set
-    ///      verifiable on-chain, because the codehash gate cannot see storage.
+    /// @dev See the contract header: this is what makes the allowlisted lane
+    ///      set verifiable on-chain, because the codehash gate cannot see
+    ///      storage.
     ///      Compare it against `keccak256(abi.encode(lanes()))`-shaped data, or
     ///      against the arrays recorded in the deploy ceremony.
     bytes32 public immutable padSetHash;
@@ -294,8 +296,8 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     // ── errors ──
 
     /// @notice Constructor lane arrays were empty or of unequal length. A lane
-    ///         set is the configuration this implementation is certified
-    ///         against; a mismatched one would certify a map nobody wrote.
+    ///         set is the configuration this implementation is allowlisted
+    ///         with; a mismatched one would vouch for a map nobody wrote.
     error InvalidLaneSet(uint256 quotesLength, uint256 padsLength);
     /// @notice A lane's quote or pad was zero, or the pad held no code. Fail at
     ///         deploy rather than at the first launch on that lane.
@@ -392,7 +394,7 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///
     ///      The last two statements are the template lock: `_initialized = true`
     ///      means `initialize` can never run on the implementation, so the
-    ///      certified address cannot be turned into somebody's clone and made
+    ///      allowlisted address cannot be turned into somebody's clone and made
     ///      to hold a launch.
     constructor(address[] memory quotes, address[] memory pads, address lens_) {
         uint256 n = quotes.length;
@@ -430,7 +432,7 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///           `owner = msg.sender` and `feeRecipient = p.feeRecipient`
     ///           before it touches the venue, so the creator role this launch
     ///           pins is pinned to an instance the calling strategy exclusively
-    ///           owns — never to this shared, certified implementation — and
+    ///           owns — never to this shared, allowlisted implementation — and
     ///           the fee stream that role earns already has its final
     ///           destination;
     ///        2. the clone transfers `p.reserveAmount` to the OWNER before it
@@ -525,9 +527,9 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///      Typed rather than raw, unlike the Sushi adapter's venue call: the
     ///      callee here is THIS CODE, written not to revert when nothing has
     ///      accrued, so a revert would be a bug worth surfacing rather than a
-    ///      venue refusing service. (`TokenizeFundStrategy._settle` wraps this
-    ///      in a tolerated raw call regardless, so a settlement is never
-    ///      stranded by it.)
+    ///      venue refusing service. (`LaunchpadStrategy` never calls this at
+    ///      all: fees are the vault's from the launch block, so no settlement
+    ///      path can be stranded by it.)
     function collectFees(bytes32 launchRef) external override returns (uint256 quoteOut, uint256 tokenOut) {
         address clone = _refToClone(launchRef);
         if (clone == address(0)) return (0, 0);
@@ -546,7 +548,8 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///
     ///      On a CLONE this answers `false` for everything: the lane map is
     ///      implementation storage and does not cross the proxy. Consumers ask
-    ///      the certified implementation, which is the address they hold anyway.
+    ///      the allowlisted implementation, which is the address they hold
+    ///      anyway.
     function quoteSupported(address quoteToken) public view override returns (bool) {
         return padOf[quoteToken] != address(0);
     }
@@ -592,16 +595,13 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///      each pad and the lens, individually); returning the lens would name
     ///      a contract this adapter never calls.
     ///
-    ///      WHAT THE ZERO DOES DOWNSTREAM, and why zero beats the lens.
-    ///      `TokenizeFundStrategy._settle` reads this and, if nonzero, calls
-    ///      `transferCreator(token, vault())` on it with tolerated failure.
-    ///      This venue HAS no creator transfer — that is the whole reason this
-    ///      adapter clones — so the call must not happen. Zero makes `_settle`
-    ///      skip it and emit `SettlementLegSkipped("launchTarget")`, which is
-    ///      the truthful record. The lens would also "work" (no such selector,
-    ///      so the call reverts and is tolerated), but it would spend the gas
-    ///      and log a FAILED transfer against a contract that has nothing to do
-    ///      with creator roles.
+    ///      NO CONSUMER CALLS THIS ADDRESS. An earlier strategy design read it
+    ///      at settlement to call a venue-native `transferCreator`; this venue
+    ///      HAS no creator transfer — that is the whole reason this adapter
+    ///      clones — and `LaunchpadStrategy` makes no venue call at settlement
+    ///      at all. Zero is the truthful answer for a deploy ceremony reading
+    ///      it; the lens would name a contract with nothing to do with creator
+    ///      roles.
     ///
     ///      AND THERE IS NOTHING FOR SUCH A CALL TO ACHIEVE HERE. The launch
     ///      named its `feeRecipient` up front and the clone has been forwarding
@@ -616,7 +616,7 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     }
 
     /// @notice The ordered lane set this implementation was constructed with.
-    /// @dev The preimage of `padSetHash`: a certifier reads these, hashes
+    /// @dev The preimage of `padSetHash`: a reviewer reads these, hashes
     ///      `abi.encode(quotes, pads)`, and compares. Empty on a clone — the
     ///      arrays are implementation storage.
     function lanes() external view returns (address[] memory quotes, address[] memory pads) {
@@ -948,14 +948,13 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///
     ///      ONE DESTINATION, UNCONDITIONALLY — no owner read, no settled/live
     ///      branch, and no "settled but the vault is unreadable" special case.
-    ///      All of that existed to keep post-settlement fees out of strategy
-    ///      custody, because until a settled strategy's residue latch arms,
-    ///      every arrival there lets a permissionless `SyndicateVault.
-    ///      collectResidue` re-stamp a fresh 7-day `depositsLocked` episode on
-    ///      the whole vault. Naming the vault at launch removes the lever
-    ///      rather than switching away from it: fees never enter strategy
-    ///      custody in ANY phase, so there is no lane to get wrong, no handoff
-    ///      to fail, and nothing here that has to read the owner at all. That
+    ///      An earlier design routed fees through the owning strategy and so
+    ///      needed all three, to keep fees arriving AFTER settlement from
+    ///      resting on a clone that had already handed everything back. Naming
+    ///      the vault at launch removes the problem rather than guarding it:
+    ///      fees never enter strategy custody in ANY phase, so there is no lane
+    ///      to get wrong, no handoff to fail, and nothing here that has to read
+    ///      the owner at all. That
     ///      also means this verb behaves identically before and after the
     ///      owning strategy settles — an owner that reverts, self-destructs or
     ///      returns short from `state()`/`vault()` can no longer influence

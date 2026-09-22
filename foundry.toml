@@ -11,7 +11,10 @@ optimizer = true
 optimizer_runs = 50
 via_ir = true
 ffi = false
-fs_permissions = [{ access = "read", path = "lib/sherwood-protocol/chains" }]
+fs_permissions = [
+    { access = "read", path = "lib/sherwood-protocol/chains" },
+    { access = "read", path = "script/launchpad" },
+]
 
 [profile.default.fmt]
 line_length = 120

@@ -1,0 +1,31 @@
+{
+  "name": "Robinhood Chain",
+  "chainId": 4663,
+  "STONK_SAFE_LAUNCHPAD_V2_WETH": "0xFCd61B25BbF3AbD6cf0070D6328E351cc30EEC9f",
+  "STONK_SAFE_LAUNCHPAD_V2_STONK": "0x8f6782c5Aa37804d08a9b7bf3984Ff3245Fd6cD4",
+  "STONK_SAFE_LAUNCHPAD_V2_USDG": "0xd4F20033586977A2511f4A2DB4aF7C79a340D70a",
+  "STONK_SAFE_LAUNCHPAD_V2_GME": "0x4B9Dcd6CCFAeF0f6D23065Dd78E79d5E20ec8cFD",
+  "STONK_SAFE_LAUNCHPAD_V2_NVDA": "0xEe96d955d5634813374ecE4C74F2C0ff71B1F9FB",
+  "STONK_SAFE_LAUNCHPAD_V2_AAPL": "0xB0453A81Cbf963903409FFF18AD92941e1c7a864",
+  "STONK_SAFE_LAUNCHPAD_V2_SPCX": "0x0c3b4EDED41696eFF0ed70841f132B519d81c947",
+  "STONK_SAFE_LAUNCHPAD_V2_USO": "0xDb3C81C841ff88db6cDFbDDB0eE049D162A6053B",
+  "STONK_SAFE_LAUNCHPAD_V3_WETH": "0x5BCEefBa6fDf437A7388aDC5c9056c827baca3B3",
+  "STONK_SAFE_LAUNCHPAD_V3_STONK": "0x406fd0B957bb8cF1dd57C78540D009578e971131",
+  "STONK_SAFE_LAUNCHPAD_V3_USDG": "0xF0A06Ac7BBb0cc3049B68c257c3ee27CcEA40eeA",
+  "STONK_SAFE_LAUNCHPAD_V3_GME": "0x5b21F8a5Ef81586627B4725844aD447325d0992B",
+  "STONK_SAFE_LAUNCHPAD_V3_NVDA": "0xDf03953DCA8dB733345278A0c5fd2E81fa2A9B54",
+  "STONK_SAFE_LAUNCHPAD_V3_AAPL": "0xc522DfaE0D1a140257702392B665183a6De7657f",
+  "STONK_SAFE_LAUNCHPAD_V3_SPCX": "0xd82da1D8ef59959b170b59147283Ab1F2F1Ca86A",
+  "STONK_SAFE_LAUNCHPAD_V3_USO": "0x644b19512052A1b6d38d7B16C6c3Fb1d3F7270D2",
+  "SAFE_LAUNCH_LENS_V2": "0x25b5Df581f4b2Ed450203f375ad8A28b17F115B3",
+  "SUSHI_LAUNCHPAD_V2": "0xF1716eBf85836ffE2985db9A50dd29e5814caBe9",
+  "SUSHI_V3_FACTORY": "0xE51960f1B45f1C9FB6D166E6a884F866fC70433B",
+  "SUSHI_V3_POSITION_MANAGER": "0x51d0e5188afe12d502e29D982d20C190e7816107",
+  "verification": {
+    "STONK_SAFE_LAUNCHPAD_*": "Verified source StonkSafeLaunchpadV2 (solc v0.8.24) on robinhoodchain.blockscout.com; one pad per quote lane, all 16 sharing one ABI. V2 pads mint the launch token; V3 pads take an external (bring-your-own) token. Every address above was confirmed on-chain on 2026-08-28 by reading quote() and matching it to the lane it is filed under -- the check that caught a transcription slip in the USDG V2 address. Live launch counts then: V2 WETH 199, STONK 62, GME 35, SPCX 10, AAPL 9, USDG 8, NVDA 4, USO 2; V3 WETH 1 and the rest 0 (fresh, so launchCount is NOT a usable identity signal for the V3 pads). Live params on every pad: launchFeeWei() == 0, creatorFeeBps() == 1650, protocolFeeBps() == 1650, lpFeeBps() == 5000. There is NO WOOD lane and no permissionless way to add one -- a StonkBrokers launch pairs against WETH, STONKBROKER, USDG or a stock token.",
+    "SAFE_LAUNCH_LENS_V2": "Verified source SafeLaunchLensV2 (solc v0.8.24); 13007 bytes of code. All reads take the pad as their first argument. priceWei(WETH_V2_PAD, 1) answered 39847682795 on 2026-08-28, i.e. it prices a real launch on a real pad. Curve math MUST be read through this lens rather than reimplemented -- the tax schedule changes every minute.",
+    "SUSHI_LAUNCHPAD_V2": "ERC-1967 UUPS proxy; implementation SushiLaunchpadV2_2 at 0x230065BdF7D8d639dc921539f16ed2FFB0521E75 (implementationVersion 2, revision 2), Sourcify exact match, read 2026-09-22. Owner 0x104Cf4b0631b88a242Fec0161055a7437708C223. launchFee 5e14 wei; quote feeds registered for WETH and USDG, none for WOOD. Launches index from block 38,395,704. Replaces Launchpad V1 0x104f1ab42674565ec3df0bfebccc4186f72fa7ed. See docs/launchpad/sushi.md.",
+    "SUSHI_V3_*": "Read from the launchpad's own v3Factory() / positionManager() on 2026-09-22; the deploy script round-trips positionManager.factory() == v3Factory, because canonical DEX addresses on this chain can hold unrelated bytecode and a code-length check passes on a squatted address. These are Sushi's V3 contracts, not the Uniswap ones in the protocol book.",
+    "source": "Moved from sherwood-protocol PR #277 (701a345): chains/4663.json + addresses/4663.json. These keys are not in the protocol's own v1 address book, so they live here."
+  }
+}

@@ -39,6 +39,10 @@ contract MockZkLighter is IZkLighter {
 
     // Storage (all zero-initialized — etch-safe, no constructor writes).
     bool public asyncRegister; // false ⇒ synchronous (default)
+    /// @notice When set, `withdrawPendingBalance` pays out only half of what it
+    ///         is asked for and leaves the rest pending — a misbehaving venue,
+    ///         for the settle all-or-revert test.
+    bool public shortClaims;
     uint48 internal _accountCounter; // first assigned index = 623 (canary-flavored)
     mapping(address => uint48) internal _accountIndex;
     mapping(uint48 => address) public accountOwner;
@@ -131,8 +135,9 @@ contract MockZkLighter is IZkLighter {
         claimCount++;
         bytes32 k = _key(owner, assetIndex);
         require(_pending[k] >= baseAmount, "insufficient pending");
-        _pending[k] -= baseAmount;
-        usdg.safeTransfer(owner, baseAmount); // 1 tick == 1 USDG base unit (6dp)
+        uint128 paid = shortClaims ? baseAmount / 2 : baseAmount;
+        _pending[k] -= paid;
+        usdg.safeTransfer(owner, paid); // 1 tick == 1 USDG base unit (6dp)
     }
 
     function getPendingBalance(address owner, uint16 assetIndex) external view returns (uint128) {
@@ -172,6 +177,10 @@ contract MockZkLighter is IZkLighter {
 
     function setAsyncRegister(bool v) external {
         asyncRegister = v;
+    }
+
+    function setShortClaims(bool v) external {
+        shortClaims = v;
     }
 
     /// @notice Manually register an account (simulates async registration landing).

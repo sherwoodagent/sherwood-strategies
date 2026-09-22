@@ -14,14 +14,13 @@ import {ISyndicateVault} from "@sherwood/interfaces/ISyndicateVault.sol";
 /// @notice The hops walked to resolve the governance-owned counterparty
 ///         allowlist from this strategy: `vault() -> governor() -> tierRegistry()
 ///         -> isCounterpartyAllowed(ZK_LIGHTER)`. The SAME registry, reached the
-///         same way, that `ConcentratedLiquidityStrategy` binds the Uniswap
-///         factory through.
+///         same way, that `PortfolioStrategy` binds its swap adapter and feeds
+///         through on v1.
 /// @dev    Declared locally rather than imported, matching
-///         `MorphoSupplyStrategy.ITierBindingPath` and
 ///         `PortfolioStrategy.ITierBindingPath`: every hop is a length-checked
-///         raw staticcall, so the strategy takes on no type dependency and no
-///         hop can revert `_initialize` undecodably. This exists to generate
-///         selectors, not to type the responses.
+///         raw staticcall, so the strategy takes on no type dependency on the
+///         governor or the registry. This exists to generate selectors, not to
+///         type the responses.
 interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
@@ -187,6 +186,9 @@ contract LighterPerpStrategy is BaseStrategy {
     error NothingQueued();
     error WithdrawalInFlight(uint256 queued, uint256 accounted);
     error NoShortfall(uint256 queued, uint256 accounted);
+    /// @notice The venue still reports a claimable balance after `_settle`
+    ///         claimed it; settling would leave deliverable value on the clone.
+    error SettleIncomplete(uint128 stillPending);
     error UnsupportedChain();
     /// @notice The vault's ERC-4626 asset is not the `USDG` this template pins.
     error AssetMismatch();
@@ -243,7 +245,8 @@ contract LighterPerpStrategy is BaseStrategy {
         for (uint256 i; i < n; i++) {
             uint16 m = mkts[i];
             if (m > MAX_MARKET_INDEX) revert InvalidMarket();
-            uint256 bit = 1 << m;
+            // forge-lint: disable-next-line(incorrect-shift)
+            uint256 bit = 1 << m; // a bit at position `m`, not `m` shifted by one
             if (seen & bit != 0) revert DuplicateMarket();
             seen |= bit;
         }
@@ -252,17 +255,15 @@ contract LighterPerpStrategy is BaseStrategy {
 
         if (address(USDG) != IERC4626(vault()).asset()) revert AssetMismatch();
 
-        // INIT IS FAIL-CLOSED ON THE REGISTRY, AND ONLY INIT — matching
-        // `MorphoSupplyStrategy._initialize`, whose note explains why a walk that
-        // yields NO registry must be fatal here and a skip at `_execute`. A
-        // governor created before `setTierRegistry`/`pushWiring` resolves to
-        // nothing, and for that whole population an early-return bind would be a
-        // silent no-op: the venue switch would read as armed while doing nothing.
-        // Refusing at bind time costs a re-proposal; refusing at execute would
-        // cost the deployed capital.
-        address registry = _resolveTierRegistry();
-        if (registry == address(0)) revert TierRegistryUnresolved();
-        _requireAllowedCounterparty(registry, address(ZK_LIGHTER));
+        // INIT IS FAIL-CLOSED ON THE REGISTRY, AND ONLY INIT — the shape
+        // `PortfolioStrategy._initialize` and `MorphoSupplyStrategy._initialize`
+        // share on v1: a walk that yields NO registry is fatal here and a skip
+        // everywhere else. A governor whose `tierRegistry` is unwired resolves to
+        // nothing, and for that population an early-return bind would be a silent
+        // no-op: the venue switch would read as armed while doing nothing.
+        // Refusing at bind time costs a re-proposal; nothing has moved yet.
+        if (_resolveTierRegistry() == address(0)) revert TierRegistryUnresolved();
+        _requireAllowedVenue();
 
         apiKeyPubKey = pubKey;
         apiKeyIndex = keyIndex;
@@ -298,14 +299,14 @@ contract LighterPerpStrategy is BaseStrategy {
 
         // RE-CERTIFY THE VENUE, and here only. Blocking `execute()` strands
         // nothing — the proposal expires at `executeBy` with the vault untouched
-        // — while blocking `settle()`/`recoverResiduals()` would strand capital already at
-        // Lighter. Degrades OPEN on an unresolved registry, which `_initialize`
-        // has already refused to allow at bind time; the case that remains is a
-        // registry unwired AFTER the clone was initialized, where the honest
-        // answer is the same one `SyndicateVault._guardBatchCalls` gives when it
-        // has no registry to ask.
-        address registry = _resolveTierRegistry();
-        if (registry != address(0)) _requireAllowedCounterparty(registry, address(ZK_LIGHTER));
+        // — while blocking `settle()` or `recoverResiduals()` would strand
+        // capital already at Lighter. An unresolved registry skips, as in
+        // `PortfolioStrategy._execute`; `_initialize` already refused that case
+        // at bind time, and on a real v1 vault it cannot reach here anyway — the
+        // vault resolves its strategy registry THROUGH `tierRegistry()`, so an
+        // unwired registry refuses the whole batch (`NotARegisteredStrategy`)
+        // before this clone is ever called.
+        _requireAllowedVenue();
 
         _pullFromVault(address(USDG), amountIn);
         USDG.forceApprove(address(ZK_LIGHTER), amountIn);
@@ -440,6 +441,8 @@ contract LighterPerpStrategy is BaseStrategy {
             if (pid == 0) revert NotAuthorized();
             ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
             if (p.strategy != address(this)) revert NotAuthorized();
+            // Validator skew is seconds; `strategyDuration` is days.
+            // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < p.executedAt + p.strategyDuration) revert NotAuthorized();
             if (returnsInitiatedAt != 0) revert AlreadyInitiated();
         }
@@ -478,6 +481,21 @@ contract LighterPerpStrategy is BaseStrategy {
     ///         structurally stale; under-stating must therefore stay correctable
     ///         AFTER settle, which rules out routing this through
     ///         `BaseStrategy.updateParams` (Executed-only).
+    ///
+    ///         STILL OPEN AFTER SETTLE ON v1, DECIDED RATHER THAN INHERITED. On
+    ///         `post-audit` the post-settle drain fed a vault consumer
+    ///         (`hasUnvaluedResidue` and `collectResidue`). v1 has neither — once
+    ///         `Settled`, nothing on-chain reads `queuedTicks` again, and the
+    ///         settle guard that does read it has already run. The reason to keep
+    ///         the door is custody, not accounting: the Lighter account is
+    ///         venue-authed to THIS contract, so this function is the only way
+    ///         anyone will ever be able to request a withdrawal of margin left
+    ///         behind by an under-stated drain, a late-closing position or an
+    ///         acknowledged shortfall that later matures. Closing it at settle
+    ///         would make that margin unrecoverable by construction. Keeping it
+    ///         costs nothing: a post-settle call only moves value from the venue
+    ///         TOWARD this clone, where `recoverResiduals()` claims it and a vault
+    ///         batch's `rescueTo(USDG)` takes it home.
     ///
     ///         C2: proposer/vault-owner-gated. The permissionless unwind path
     ///         must never be able to choose the drain amount — a wrong amount
@@ -527,6 +545,15 @@ contract LighterPerpStrategy is BaseStrategy {
     ///             needed. Arming while
     ///             `accounted == 0` (nothing matured yet) stays legal — that is
     ///             the normal venue-under-fill case.
+    ///
+    ///         THE WAIVER DOES NOT WAIVE THE GOVERNOR. v1's `settleProposal`
+    ///         refuses to finish below a price-per-share floor derived from the
+    ///         proposal's `maxDrawdownBps` (capped at `MAX_STAMP_DRAWDOWN_BPS`,
+    ///         90%): an acknowledged shortfall deeper than the declared drawdown
+    ///         makes the whole settlement revert `SettlePriceBelowFloor`, and the
+    ///         proposal then needs `unstick` (floor at the 90% cap) or the
+    ///         owner's guardian-reviewed emergency settle. Declare the drawdown
+    ///         envelope for a perp venue with that in mind.
     function acknowledgeShortfall() external {
         _requireProposerOrOwner();
         if (returnsInitiatedAt == 0) revert ReturnsNotInitiated();
@@ -542,7 +569,19 @@ contract LighterPerpStrategy is BaseStrategy {
 
     /// @notice Unwind step 3 (governor-called). Claims the matured pending USDG
     ///         and pushes this contract's entire USDG balance to the vault.
-    /// @dev    Guards, in order:
+    /// @dev    ALL-OR-REVERT. A successful `settle()` leaves this clone holding
+    ///         nothing it could have delivered: the venue's matured pending
+    ///         balance is claimed and re-read (`SettleIncomplete` if anything is
+    ///         still claimable), and then the whole USDG balance — claim, prior
+    ///         third-party claims and donations alike — goes to `vault()`. USDG is
+    ///         the only token this template ever takes custody of; anything else
+    ///         sent here was sent by someone outside the template and is the
+    ///         vault's to take with `rescueTo(token)`. What settlement CANNOT
+    ///         deliver is value that is not yet this contract's to claim — ticks
+    ///         queued but not matured, and L2 margin never queued — and the guards
+    ///         below exist so that it is not booked as a loss by accident.
+    ///
+    ///         Guards, in order:
     ///           - `ReturnsNotInitiated` — positions were never closed.
     ///           - `SettleTooSoon`       — same block as the close (async maturity).
     ///           - `NothingQueued`       — no drain was ever requested, so a
@@ -580,7 +619,16 @@ contract LighterPerpStrategy is BaseStrategy {
             if (accounted < queuedTicks) revert WithdrawalInFlight(queuedTicks, accounted);
         }
 
-        if (pending > 0) ZK_LIGHTER.withdrawPendingBalance(address(this), USDG_ASSET_INDEX, pending);
+        if (pending > 0) {
+            ZK_LIGHTER.withdrawPendingBalance(address(this), USDG_ASSET_INDEX, pending);
+            // The venue is third-party code behind a proxy. If a claim ever pays
+            // out less than it was asked for, settling anyway would leave a
+            // claimable balance behind that the governor's P&L has already
+            // booked as lost; refusing keeps settlement all-or-revert, and the
+            // proposal's emergency paths remain for a venue that stays broken.
+            uint128 left = ZK_LIGHTER.getPendingBalance(address(this), USDG_ASSET_INDEX);
+            if (left != 0) revert SettleIncomplete(left);
+        }
         _deliver();
 
         settled = true;
@@ -680,7 +728,7 @@ contract LighterPerpStrategy is BaseStrategy {
     // ── Governance-allowlist binding ──
 
     /// @dev BINDS THE VENUE ON THE COUNTERPARTY AXIS, the way
-    ///      `ConcentratedLiquidityStrategy` binds the Uniswap factory. `ZK_LIGHTER`
+    ///      `PortfolioStrategy` binds its swap adapter. `ZK_LIGHTER`
     ///      is a `constant` here rather than proposer input, so this is not
     ///      protection against a hostile address — it is the governance switch
     ///      that lets an owner make this template INERT without touching the
@@ -711,37 +759,46 @@ contract LighterPerpStrategy is BaseStrategy {
     ///      hand a demotion — or an unreachable registry — the power to freeze
     ///      capital already at the venue. `MorphoSupplyStrategy._requireAllowedMorpho`
     ///      spells the same asymmetry out.
-    function _requireAllowedCounterparty(address registry, address counterparty) private view {
-        if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (counterparty)))) {
-            revert CounterpartyNotAllowed(counterparty, registry);
+    ///
+    ///      Skips on an unresolved registry, like `PortfolioStrategy`'s
+    ///      `_requireAllowedAdapter`; `_initialize` is fail-closed on that case
+    ///      separately.
+    function _requireAllowedVenue() private view {
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) return;
+        if (!_isCounterpartyAllowed(registry, address(ZK_LIGHTER))) {
+            revert CounterpartyNotAllowed(address(ZK_LIGHTER), registry);
         }
     }
 
     /// @dev The `vault() -> governor() -> tierRegistry()` walk. `address(0)` when
-    ///      unresolved (no `governor()` surface, a governor predating the getter,
-    ///      or `tierRegistry() == 0`).
+    ///      any hop is unreadable (no `governor()` surface, a governor without
+    ///      the getter, or `tierRegistry() == 0`).
     function _resolveTierRegistry() private view returns (address registry) {
         address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
         if (governor_ == address(0)) return address(0);
         registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
     }
 
-    /// @dev Staticcall-safe allowlist read. Unreadable → `false`.
+    /// @dev `PortfolioStrategy._isCounterpartyAllowed`, byte for byte. A codeless
+    ///      registry, a revert, or a return that is not exactly one word all
+    ///      read as "not allowed" and surface as the named
+    ///      `CounterpartyNotAllowed`.
     ///
-    ///      READS THE WORD, DOES NOT `abi.decode` IT. `abi.decode(ret, (bool))`
-    ///      reverts on any returned word outside `{0, 1}`, and that revert would
-    ///      land in THIS frame with nothing to catch it — bricking `_initialize`
-    ///      instead of resolving to "not vouched for". Mirrors
-    ///      `ConcentratedLiquidityStrategy._readAllowed`.
-    function _readAllowed(address registry, bytes memory data) private view returns (bool) {
+    ///      DECODES THE WORD, where post-audit's copy read `word != 0`. The
+    ///      difference is a returned word outside `{0, 1}`: `word != 0` read it
+    ///      as a GRANT, while `abi.decode(ret, (bool))` reverts in this frame.
+    ///      Both refusal shapes are closed — `_initialize` and `_execute` are
+    ///      the only callers, and neither moves funds before this check — so the
+    ///      stricter one is taken, with its cost stated: a malformed registry
+    ///      answer fails init / execute with empty revert data instead of a
+    ///      named error.
+    function _isCounterpartyAllowed(address registry, address venue) private view returns (bool) {
         if (registry.code.length == 0) return false;
-        (bool ok, bytes memory ret) = registry.staticcall(data);
+        (bool ok, bytes memory ret) =
+            registry.staticcall(abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (venue)));
         if (!ok || ret.length != 32) return false;
-        uint256 word;
-        assembly ("memory-safe") {
-            word := mload(add(ret, 0x20))
-        }
-        return word != 0;
+        return abi.decode(ret, (bool));
     }
 
     // ── Coverage scaling ──
@@ -839,7 +896,8 @@ contract LighterPerpStrategy is BaseStrategy {
             word := mload(add(ret, 0x20))
         }
         if (word >> 160 != 0) return address(0);
-        return address(uint160(word));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return address(uint160(word)); // upper 96 bits checked zero on the line above
     }
 
     function _deliver() internal returns (uint256 bal) {

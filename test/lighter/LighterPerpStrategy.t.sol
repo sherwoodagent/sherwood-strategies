@@ -1453,8 +1453,6 @@ contract LighterPerpStrategyAuthTest is LighterPerpStrategyBase {
     }
 }
 
-// ── Minimal mocks for the initiateReturn auth path ──
-
 /// @notice The coverage-scaled deposit (`_execute` deploys what the proposal's
 ///         `effectiveMaxCapital` can actually cover, not the pinned
 ///         `depositAmount`). Its own contract for the same solc tag-space reason
@@ -1604,6 +1602,296 @@ contract LighterPerpStrategyCoverageTest is LighterPerpStrategyBase {
     }
 }
 
+/// @notice What the v1 port changed or decided: all-or-revert settlement, the
+///         counterparty gate re-expressed on `PortfolioStrategy`'s helper, the
+///         `rescueTo` interaction with the settle guard, the post-settle drain
+///         door, and the absence of the deleted `post-audit` surface.
+contract LighterPerpStrategyV1Test is LighterPerpStrategyBase {
+    // ==================== ALL-OR-REVERT SETTLE ====================
+
+    /// @dev Everything the clone can observe is zero after a clean settle: no
+    ///      USDG, no claimable pending balance at the venue, no ETH, and no
+    ///      lingering allowance to the venue.
+    function test_v1_settle_leavesCloneEmpty() public {
+        _settleClean();
+        _assertCloneEmpty(strategy);
+        assertEq(usdg.balanceOf(vault), DEPOSIT, "vault got everything");
+        assertEq(strategy.returnedAssets(), DEPOSIT);
+    }
+
+    /// @dev The push is the WHOLE balance, whatever its source: matured pending
+    ///      claimed in `_settle`, a third party's earlier claim onto the clone,
+    ///      and a donation, all in one settlement.
+    function test_v1_settle_deliversPendingHeldAndDonated() public {
+        _executeFirst();
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.maturePartial(address(strategy), 12_000e6);
+        vm.prank(attacker);
+        zk.withdrawPendingBalance(address(strategy), 3, 4_000e6); // third party claims part onto the clone
+        zk.maturePartial(address(strategy), 8_000e6);
+        usdg.mint(address(strategy), 7); // donation
+        vm.roll(block.number + 1);
+
+        vm.prank(vault);
+        strategy.settle();
+
+        _assertCloneEmpty(strategy);
+        assertEq(usdg.balanceOf(vault), DEPOSIT + 7);
+    }
+
+    /// @dev Same property on the waiver path: whatever HAS matured is delivered,
+    ///      and only the not-yet-matured remainder stays at the venue.
+    function test_v1_settle_withAcknowledgedShortfall_leavesCloneEmpty() public {
+        _armedShortfall();
+        vm.prank(proposer);
+        strategy.acknowledgeShortfall();
+        vm.prank(vault);
+        strategy.settle();
+
+        _assertCloneEmpty(strategy);
+        assertEq(usdg.balanceOf(vault), DEPOSIT - 10_000e6);
+        assertEq(zk.queued(address(strategy)), 5_000e6, "unmatured remainder is still the venue's");
+    }
+
+    /// @dev A venue claim that pays less than asked leaves claimable value
+    ///      behind; settling would book it as lost. `_settle` refuses instead.
+    function test_v1_settle_shortVenueClaim_reverts() public {
+        _executeFirst();
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.mature(address(strategy));
+        vm.roll(block.number + 1);
+        zk.setShortClaims(true);
+
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.SettleIncomplete.selector, uint128(DEPOSIT / 2)));
+        strategy.settle();
+        assertEq(uint8(strategy.state()), uint8(BaseStrategy.State.Executed), "rolled back");
+        assertEq(usdg.balanceOf(vault), 0);
+    }
+
+    /// @dev Any split of the returned USDG between "matured at the venue" and
+    ///      "already on the clone" settles to an empty clone.
+    function testFuzz_v1_settle_alwaysLeavesCloneEmpty(uint256 maturedFirst, uint256 claimedEarly, uint256 donation)
+        public
+    {
+        maturedFirst = bound(maturedFirst, 0, DEPOSIT);
+        claimedEarly = bound(claimedEarly, 0, maturedFirst);
+        donation = bound(donation, 0, 1e12);
+
+        _executeFirst();
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.maturePartial(address(strategy), maturedFirst);
+        if (claimedEarly > 0) zk.withdrawPendingBalance(address(strategy), 3, uint128(claimedEarly));
+        zk.maturePartial(address(strategy), DEPOSIT - maturedFirst);
+        if (donation > 0) usdg.mint(address(strategy), donation);
+        vm.roll(block.number + 1);
+
+        vm.prank(vault);
+        strategy.settle();
+
+        _assertCloneEmpty(strategy);
+        assertEq(usdg.balanceOf(vault), DEPOSIT + donation);
+    }
+
+    // ==================== rescueTo vs THE SETTLE GUARD ====================
+
+    /// @dev `rescueTo` is inherited, `onlyVault` and not `virtual`, so
+    ///      `returnedAssets` cannot count it. A vault batch that rescues USDG
+    ///      off the clone before `settle()` therefore reads as a shortfall — not
+    ///      a brick: the waiver lets settlement through and nothing is lost,
+    ///      because the rescued USDG is already in the vault.
+    function test_v1_rescueBeforeSettle_readsAsShortfall_waiverUnblocks() public {
+        _executeFirst();
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.mature(address(strategy));
+        vm.roll(block.number + 1);
+
+        assertEq(_vaultRescue(), DEPOSIT); // e.g. an owner emergency batch
+
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.WithdrawalInFlight.selector, DEPOSIT, 0));
+        strategy.settle();
+
+        vm.prank(owner);
+        strategy.acknowledgeShortfall();
+        vm.prank(vault);
+        strategy.settle();
+
+        _assertCloneEmpty(strategy);
+        assertEq(usdg.balanceOf(vault), DEPOSIT, "nothing lost");
+    }
+
+    // ==================== POST-SETTLE DRAIN DOOR ====================
+
+    /// @dev The door stays open after settle (custody: the venue answers only
+    ///      to this contract) but keeps its auth: the permissionless world gets
+    ///      no say over the drain amount after settlement either.
+    function test_v1_queueWithdraw_afterSettle_keepsItsAuth() public {
+        _settleClean();
+        usdg.mint(ZK, 500e6);
+        zk.creditL2(address(strategy), 500e6);
+
+        vm.prank(attacker);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
+        strategy.queueWithdraw(500e6);
+
+        vaultC.setAgent(proposer, false); // a de-registered proposer loses it too
+        vm.prank(proposer);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
+        strategy.queueWithdraw(500e6);
+
+        vm.prank(owner);
+        strategy.queueWithdraw(500e6);
+        zk.mature(address(strategy));
+        assertEq(_vaultRescue(), 500e6);
+        _assertCloneEmpty(strategy);
+    }
+
+    /// @dev A post-settle drain only ever moves value TOWARD the clone: the
+    ///      vault's balance does not change until a vault batch rescues it.
+    function test_v1_queueWithdraw_afterSettle_movesNothingToTheVault() public {
+        _settleClean();
+        usdg.mint(ZK, 500e6);
+        zk.creditL2(address(strategy), 500e6);
+        uint256 vaultBefore = usdg.balanceOf(vault);
+
+        vm.prank(proposer);
+        strategy.queueWithdraw(500e6);
+        zk.mature(address(strategy));
+        vm.prank(attacker);
+        strategy.recoverResiduals();
+
+        assertEq(usdg.balanceOf(vault), vaultBefore);
+        assertEq(usdg.balanceOf(address(strategy)), 500e6);
+    }
+
+    // ==================== COUNTERPARTY GATE (init + execute) ====================
+
+    function test_v1_gate_registryReverts_refusesInit() public {
+        _useMalformedRegistry(MockMalformedTierRegistry.Mode.Revert);
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.CounterpartyNotAllowed.selector, ZK, bad));
+        s.initialize(vault, proposer, _initData(DEPOSIT));
+    }
+
+    function test_v1_gate_registryShortReturn_refusesInit() public {
+        _useMalformedRegistry(MockMalformedTierRegistry.Mode.ShortReturn);
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.CounterpartyNotAllowed.selector, ZK, bad));
+        s.initialize(vault, proposer, _initData(DEPOSIT));
+    }
+
+    function test_v1_gate_codelessRegistry_refusesInit() public {
+        address eoa = makeAddr("codelessRegistry");
+        gov.setTierRegistry(eoa);
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.CounterpartyNotAllowed.selector, ZK, eoa));
+        s.initialize(vault, proposer, _initData(DEPOSIT));
+    }
+
+    /// @dev THE BEHAVIOUR CHANGE vs post-audit. A word outside {0, 1} used to
+    ///      read as a grant (`word != 0`); `PortfolioStrategy`'s decode refuses
+    ///      it. Unnamed, but closed.
+    function test_v1_gate_dirtyWord_refusesInit() public {
+        _useMalformedRegistry(MockMalformedTierRegistry.Mode.DirtyWord);
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(bytes(""));
+        s.initialize(vault, proposer, _initData(DEPOSIT));
+    }
+
+    function test_v1_gate_registryReverts_refusesExecute_vaultUntouched() public {
+        _useMalformedRegistry(MockMalformedTierRegistry.Mode.Revert);
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.CounterpartyNotAllowed.selector, ZK, bad));
+        strategy.execute();
+        assertEq(usdg.balanceOf(vault), DEPOSIT);
+        assertEq(zk.depositCount(), 0);
+    }
+
+    function test_v1_gate_dirtyWord_refusesExecute_vaultUntouched() public {
+        _useMalformedRegistry(MockMalformedTierRegistry.Mode.DirtyWord);
+        vm.prank(vault);
+        vm.expectRevert(bytes(""));
+        strategy.execute();
+        assertEq(usdg.balanceOf(vault), DEPOSIT);
+        assertEq(zk.depositCount(), 0);
+    }
+
+    /// @dev The gate is init + execute ONLY. With the registry actively
+    ///      reverting, every exit and kill-switch path still runs.
+    function test_v1_gate_brokenRegistry_neverBlocksTheExit() public {
+        _executeFirst();
+        _useMalformedRegistry(MockMalformedTierRegistry.Mode.Revert);
+
+        vm.startPrank(proposer);
+        strategy.guardrailAction(abi.encode(uint8(1), bytes("")));
+        strategy.updateParams(abi.encode(uint8(2), abi.encode(uint16(1), uint32(1), uint8(1))));
+        strategy.registerAgentKey();
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.mature(address(strategy));
+        strategy.recoverResiduals();
+        vm.roll(block.number + 1);
+        vm.prank(vault);
+        strategy.settle();
+
+        _assertCloneEmpty(strategy);
+        assertEq(usdg.balanceOf(vault), DEPOSIT);
+    }
+
+    // ==================== DELETED post-audit SURFACE ====================
+
+    /// @dev The residue probes and the `sweep()` door are gone. Pinned so a
+    ///      future re-add is a deliberate act: v1 has no consumer for any of them.
+    function test_v1_noDeliveryOrSweepSurface() public {
+        _settleClean();
+        bytes4[4] memory gone = [
+            bytes4(keccak256("hasUndeliveredValue()")),
+            bytes4(keccak256("undeliveredValue()")),
+            bytes4(keccak256("hasUnvaluedResidue()")),
+            bytes4(keccak256("sweep()"))
+        ];
+        for (uint256 i; i < gone.length; i++) {
+            vm.prank(vault);
+            (bool ok,) = address(strategy).call(abi.encodeWithSelector(gone[i]));
+            assertFalse(ok);
+        }
+    }
+
+    // ── helpers ──
+
+    address internal bad;
+
+    function _useMalformedRegistry(MockMalformedTierRegistry.Mode m) internal {
+        MockMalformedTierRegistry r = new MockMalformedTierRegistry();
+        r.setMode(m);
+        bad = address(r);
+        gov.setTierRegistry(bad);
+    }
+
+    function _assertCloneEmpty(LighterPerpStrategy s) internal view {
+        assertEq(usdg.balanceOf(address(s)), 0, "clone USDG");
+        assertEq(s.pendingBalance(), 0, "claimable at the venue");
+        assertEq(address(s).balance, 0, "clone ETH");
+        assertEq(usdg.allowance(address(s), ZK), 0, "venue allowance");
+    }
+}
+
+// ── Minimal mocks ──
+
 contract MockVaultForLighter {
     address public governor;
     address public owner;
@@ -1719,5 +2007,38 @@ contract MockGovernorForLighter {
         p.strategy = _strategy;
         p.executedAt = _executedAt;
         p.strategyDuration = _duration;
+    }
+}
+
+/// @notice A registry that answers `isCounterpartyAllowed` badly, one way per
+///         mode. Everything goes through `fallback` so the answer's length and
+///         content are fully controlled.
+contract MockMalformedTierRegistry {
+    enum Mode {
+        Revert,
+        DirtyWord,
+        ShortReturn
+    }
+
+    Mode public mode;
+
+    function setMode(Mode m) external {
+        mode = m;
+    }
+
+    fallback() external {
+        Mode m = mode;
+        assembly ("memory-safe") {
+            switch m
+            case 0 { revert(0, 0) }
+            case 1 {
+                mstore(0, 2)
+                return(0, 32)
+            }
+            default {
+                mstore(0, 1)
+                return(31, 1)
+            }
+        }
     }
 }

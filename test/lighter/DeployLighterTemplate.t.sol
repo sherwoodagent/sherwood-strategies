@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {StrategyFactory} from "@sherwood/StrategyFactory.sol";
 import {TierRegistry} from "@sherwood/TierRegistry.sol";
+import {LighterPerpStrategy} from "../../src/lighter/LighterPerpStrategy.sol";
 import {IStrategy} from "@sherwood/interfaces/IStrategy.sol";
 import {DeployLighterTemplate} from "../../script/lighter/DeployLighterTemplate.s.sol";
 import {MockZkLighter} from "../mocks/MockZkLighter.sol";
@@ -79,22 +80,21 @@ contract DeployLighterTemplateTest is Test {
 
     /// @dev A certified money-moving selector must fail the post-flight: the
     ///      template would be priced as a bounded adapter, which it is not.
+    ///      Certifies a template this test deployed and runs the post-flight on
+    ///      it directly, rather than predicting the ceremony's CREATE address,
+    ///      which differs across Foundry versions.
     function test_ceremony_certifiedExecute_isRefused() public {
-        // Pre-certify the class of the template the ceremony is about to deploy:
-        // CREATE from the script at its current nonce.
-        address predicted = vm.computeCreateAddress(address(script), vm.getNonce(address(script)));
-        vm.etch(predicted, hex"00"); // any code, so proposeClassCertification accepts it
+        address template = address(new LighterPerpStrategy());
         vm.startPrank(address(script));
         registry.proposeClassCertification(
-            predicted, IStrategy.execute.selector, 0, 1, address(script), predicted.codehash
+            template, IStrategy.execute.selector, 0, 1, address(script), template.codehash
         );
         vm.warp(block.timestamp + registry.certifyDelay());
         vm.stopPrank();
-        registry.certifyClass(predicted, IStrategy.execute.selector);
-        vm.etch(predicted, ""); // clear it so the CREATE can land
+        registry.certifyClass(template, IStrategy.execute.selector);
 
         vm.expectRevert(bytes("execute()/settle() must stay UNCERTIFIED"));
-        script.ceremony(address(factory), address(registry), ZK, address(script));
+        script.assertUncertified(address(registry), template);
     }
 
     function test_venue_readsTheBook() public view {

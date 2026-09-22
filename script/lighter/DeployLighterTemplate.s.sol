@@ -177,8 +177,14 @@ contract DeployLighterTemplate is Script {
             console.log("RUNBOOK:   TierRegistry:", registry);
         }
 
-        // THE READ THAT PROVES THE PRICING DECISION. Both must be the uncertified
-        // default; see the header.
+        assertUncertified(registry, template);
+    }
+
+    /// @notice THE READ THAT PROVES THE PRICING DECISION: `execute()` and
+    ///         `settle()` must both price at the uncertified default (tier 2,
+    ///         10000 bps); see the header. Separate from `ceremony` so it can be
+    ///         checked against any template, not only one this run deployed.
+    function assertUncertified(address registry, address template) public view {
         (uint8 te, uint16 be) = TierRegistry(registry).classTierOf(template, IStrategy.execute.selector);
         (uint8 ts, uint16 bs) = TierRegistry(registry).classTierOf(template, IStrategy.settle.selector);
         console.log("classTierOf(execute) tier / boundBps (expect 2 / 10000):", te, be);

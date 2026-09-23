@@ -254,6 +254,68 @@ contract DeployLaunchpadStrategyForkTest is Test {
         assertFalse(factory.approvedTemplate(address(script.template())), "no approval without ownership");
     }
 
+    // ── replacing only the Stonk adapter ──
+
+    /// @notice `redeployStonkAdapter` over a complete owned deployment: a new
+    ///         adapter with the same lanes is granted, the old one stays
+    ///         allowed (its revoke is the owner's call), the template and the
+    ///         Sushi adapter are untouched, the deployment verifies with the new
+    ///         address, and a test run writes no book.
+    function test_redeployStonk_grantsTheNewAdapterAndLeavesTheRestAlone() public {
+        _skipIfNoFork();
+
+        (TierRegistry registry, StrategyFactory factory) = _ownedSingletons(_broadcaster());
+        vm.prank(_broadcaster());
+        registry.setStrategyFactory(address(factory));
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        script.deploy(address(registry), address(factory));
+        address oldStonk = address(script.stonkAdapter());
+        address template = address(script.template());
+        address sushi = address(script.sushiAdapter());
+
+        script.redeployStonkAdapter(address(registry), oldStonk);
+        address newStonk = address(script.stonkAdapter());
+
+        assertTrue(newStonk != oldStonk, "a new adapter was deployed");
+        assertEq(StonkLaunchAdapter(newStonk).implementation(), newStonk, "the new adapter IS the implementation");
+        assertEq(
+            StonkLaunchAdapter(newStonk).padSetHash(),
+            StonkLaunchAdapter(oldStonk).padSetHash(),
+            "same lanes as the adapter it replaces"
+        );
+        assertTrue(registry.isCounterpartyAllowed(newStonk), "new adapter granted");
+        assertTrue(registry.isCounterpartyAllowed(oldStonk), "old adapter left allowed");
+        assertEq(address(script.template()), template, "template untouched");
+        assertEq(address(script.sushiAdapter()), sushi, "Sushi adapter untouched");
+
+        script.verifyDeployment(address(registry), address(factory), template, newStonk, sushi);
+        assertFalse(vm.exists(script.deploymentsPath(block.chainid)), "a test run wrote the deployments book");
+    }
+
+    /// @notice Without registry ownership the new adapter is deployed but not
+    ///         granted; the Safe executes the printed transaction.
+    function test_redeployStonk_grantsNothingWhenTheBroadcasterDoesNotOwnTheRegistry() public {
+        _skipIfNoFork();
+
+        address safe = makeAddr("ownerSafe");
+        (TierRegistry registry, StrategyFactory factory) = _ownedSingletons(safe);
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        script.deploy(address(registry), address(factory));
+        address oldStonk = address(script.stonkAdapter());
+
+        script.redeployStonkAdapter(address(registry), oldStonk);
+        assertFalse(registry.isCounterpartyAllowed(address(script.stonkAdapter())), "no grant without ownership");
+    }
+
+    function test_redeployStonk_rejectsAWrongChainId() public {
+        _skipIfNoFork();
+        vm.chainId(1);
+
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        vm.expectRevert(bytes("wrong chain: expected Robinhood mainnet 4663 or its 9994663 fork"));
+        script.redeployStonk();
+    }
+
     // ── the Stonk lane set ──
 
     /// @notice The lanes the book actually names are internally consistent:

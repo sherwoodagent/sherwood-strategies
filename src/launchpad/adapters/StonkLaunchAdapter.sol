@@ -245,6 +245,11 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///         nothing moved and anyone may retry it forever.
     event VenueLegSkipped(bytes32 indexed leg);
 
+    /// @notice A `cloneFinalize` venue leg ran out of gas under the 63/64 rule.
+    /// @dev Reverting (rather than tolerating, like a refused leg) is what lets
+    ///      `eth_estimateGas` find a limit at which the leg actually runs.
+    error VenueLegStarved(bytes32 leg);
+
     /// @notice A TOLERATED VENUE CALL DID NOT GO THROUGH. Emitted where a
     ///         failed venue leg is otherwise INVISIBLE — the return value is
     ///         `(0, 0)`, which is also what an honest "nothing accrued" looks
@@ -924,16 +929,34 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         (bool ok, LaunchFlags memory f) = _readLaunchFlags(padAddress, id);
         if (!ok || f.aborted) return;
 
+        // A leg the VENUE refuses is tolerated (the curve may simply not be
+        // graduatable yet). A leg that ran out of gas is NOT: EIP-150 forwards
+        // only 63/64 of the gas, so under an `eth_estimateGas` limit the parent
+        // survives a starved child, and estimation then settles on exactly that
+        // limit. Observed on the Robinhood vnet (2026-09-22): every CLI
+        // `launchpad finalize` graduated the curve, starved `bond` (~1.36M gas)
+        // and returned success, leaving the launch in Closing indefinitely.
+        // Reverting on starvation makes the estimator search upward to a limit
+        // at which both legs run. Nothing on a settlement path calls this.
         if (!f.graduated) {
+            uint256 gasBeforeGraduate = gasleft();
             // solhint-disable-next-line avoid-low-level-calls
             (bool graduated,) = padAddress.call(abi.encodeCall(IStonkSafeLaunchpadV2.graduate, (id)));
-            if (graduated) f.graduated = true;
-            else emit VenueLegSkipped("graduate");
+            if (graduated) {
+                f.graduated = true;
+            } else {
+                if (gasleft() <= gasBeforeGraduate / 63) revert VenueLegStarved("graduate");
+                emit VenueLegSkipped("graduate");
+            }
         }
         if (f.graduated && !f.bonded) {
+            uint256 gasBeforeBond = gasleft();
             // solhint-disable-next-line avoid-low-level-calls
             (bool bonded,) = padAddress.call(abi.encodeCall(IStonkSafeLaunchpadV2.bond, (id)));
-            if (!bonded) emit VenueLegSkipped("bond");
+            if (!bonded) {
+                if (gasleft() <= gasBeforeBond / 63) revert VenueLegStarved("bond");
+                emit VenueLegSkipped("bond");
+            }
         }
     }
 

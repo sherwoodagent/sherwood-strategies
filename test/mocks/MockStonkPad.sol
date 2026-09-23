@@ -61,6 +61,11 @@ contract MockStonkPad {
     ///         and return no data — the EIP-150 63/64 shape that made a failed
     ///         venue call indistinguishable from "nothing accrued" on 4663.
     bool public flushBurnsGas;
+    /// @notice Make `graduate` / `bond` burn every unit of gas forwarded (a
+    ///         starved child under the 63/64 rule), or make `bond` refuse.
+    bool public graduateBurnsGas;
+    bool public bondBurnsGas;
+    bool public bondReverts;
 
     uint256 public nextId = 1;
     mapping(uint256 id => IStonkSafeLaunchpadV2.Launch launch) internal _launches;
@@ -113,6 +118,18 @@ contract MockStonkPad {
 
     function setFlushBurnsGas(bool value) external {
         flushBurnsGas = value;
+    }
+
+    function setGraduateBurnsGas(bool value) external {
+        graduateBurnsGas = value;
+    }
+
+    function setBondBurnsGas(bool value) external {
+        bondBurnsGas = value;
+    }
+
+    function setBondReverts(bool value) external {
+        bondReverts = value;
     }
 
     // ── venue surface ──
@@ -260,6 +277,11 @@ contract MockStonkPad {
     ///      an open-ended curve, or one still inside its window, where reaching
     ///      the market cap is what qualifies it.
     function graduate(uint256 id) external {
+        if (graduateBurnsGas) {
+            assembly ("memory-safe") {
+                invalid()
+            }
+        }
         IStonkSafeLaunchpadV2.Launch storage l = _load(id);
         if (l.aborted) revert Aborted();
         if (l.graduated) revert NotGraduatable();
@@ -270,6 +292,12 @@ contract MockStonkPad {
 
     /// @dev Permissionless; requires `graduated`.
     function bond(uint256 id) external {
+        if (bondBurnsGas) {
+            assembly ("memory-safe") {
+                invalid()
+            }
+        }
+        if (bondReverts) revert AlreadyBonded();
         IStonkSafeLaunchpadV2.Launch storage l = _load(id);
         if (!l.graduated) revert NotGraduated();
         if (l.bonded) revert AlreadyBonded();

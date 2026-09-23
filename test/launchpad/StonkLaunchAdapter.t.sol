@@ -638,6 +638,54 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Live));
     }
 
+    /// @dev The 2026-09-22 vnet failure: `graduate` runs, `bond` is starved by
+    ///      the 63/64 rule, and the call used to RETURN SUCCESS with the launch
+    ///      stuck in Closing. A starved leg now reverts, so gas estimation climbs.
+    function test_Finalize_RevertsWhenTheBondLegIsGasStarved() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        uint256 id = _clone(res).launchId();
+        wethPad.setGraduatable(true);
+        wethPad.setBondBurnsGas(true);
+
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.VenueLegStarved.selector, bytes32("bond")));
+        adapter.finalize(res.launchRef);
+        assertFalse(wethPad.getLaunch(id).graduated, "the graduate leg rolled back with it");
+
+        // With the venue healthy (i.e. enough gas), one call does both legs.
+        wethPad.setBondBurnsGas(false);
+        vm.prank(keeper);
+        adapter.finalize(res.launchRef);
+        assertTrue(wethPad.getLaunch(id).bonded, "bonded");
+        assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Live));
+    }
+
+    function test_Finalize_RevertsWhenTheGraduateLegIsGasStarved() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        wethPad.setGraduatable(true);
+        wethPad.setGraduateBurnsGas(true);
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.VenueLegStarved.selector, bytes32("graduate")));
+        adapter.finalize(res.launchRef);
+    }
+
+    /// @dev A bond the VENUE refuses (with gas to spare) is still tolerated:
+    ///      graduation sticks, `VenueLegSkipped("bond")` is logged, phase is Closing.
+    function test_Finalize_ToleratesARefusedBondLeg() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        uint256 id = _clone(res).launchId();
+        wethPad.setGraduatable(true);
+        wethPad.setBondReverts(true);
+
+        vm.expectEmit(true, false, false, false, address(_clone(res)));
+        emit StonkLaunchAdapter.VenueLegSkipped("bond");
+        vm.prank(keeper);
+        adapter.finalize(res.launchRef);
+        assertTrue(wethPad.getLaunch(id).graduated, "graduated");
+        assertFalse(wethPad.getLaunch(id).bonded, "bond refused");
+        assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Closing));
+    }
+
     function test_CollectFees_PaysTheFeeRecipientAndNeverTheStrategyOrCaller() public {
         ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
         StonkLaunchAdapter clone = _clone(res);

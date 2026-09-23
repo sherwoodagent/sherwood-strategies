@@ -99,6 +99,13 @@ interface IPositionManagerFactory {
  *   Verify either afterwards:
  *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
  *       --rpc-url <same> --sig 'verify()'
+ *
+ *   REPLACING ONLY THE STONK ADAPTER (a fix to `StonkLaunchAdapter`):
+ *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
+ *       --rpc-url <same> --account sherwood-deployer --broadcast --slow --sig 'redeployStonk()'
+ *   The template and the Sushi adapter are untouched, and so are the pads and
+ *   the lens (already granted). See `redeployStonkAdapter` for why the old
+ *   adapter is NOT revoked by the script.
  */
 contract DeployLaunchpadStrategy is DeploymentsBook {
     /// @dev Robinhood Chain MaxCodeSize is 98,304 bytes (4x EIP-170).
@@ -239,6 +246,79 @@ contract DeployLaunchpadStrategy is DeploymentsBook {
             "launchpad", "sushiLaunchpadImplementation", vm.load(sushiLaunchpad, _ERC1967_IMPLEMENTATION_SLOT)
         );
         _recordMeta("launchpad", vm.serializeBool("launchpad", "ownerStepsComplete", ownsRegistry && ownsFactory));
+    }
+
+    /// @notice Replace ONLY the Stonk adapter: `--sig 'redeployStonk()'`.
+    function redeployStonk() external {
+        require(_isRobinhood(), "wrong chain: expected Robinhood mainnet 4663 or its 9994663 fork");
+        redeployStonkAdapter(_protocolAddress("TIER_REGISTRY"), _requireDeployedAddress("STONK_LAUNCH_ADAPTER"));
+    }
+
+    /// @notice Deploy a new `StonkLaunchAdapter` over the book's eight V2 lanes,
+    ///         grant it when the broadcaster owns the registry (print the Safe
+    ///         transaction otherwise), and record it as `STONK_LAUNCH_ADAPTER`.
+    /// @dev    THE OLD ADAPTER IS LEFT ALLOWED, and its revoke is printed, not
+    ///         sent. `LaunchpadStrategy` checks `isCounterpartyAllowed` at init
+    ///         and at `_execute`, never at `_settle`/`claim`, so a revoke cannot
+    ///         strand a launch that already executed. It DOES make every clone
+    ///         bound to the old adapter that has not executed yet revert at
+    ///         execute, and a live vnet sim can hold such proposals. Revoking is
+    ///         therefore the owner's call, made once those have drained.
+    /// @param  replaces The adapter this one supersedes; recorded, never called
+    ///         except to read its lane configuration for comparison.
+    function redeployStonkAdapter(address registry, address replaces) public {
+        (address[] memory quotes, address[] memory pads) = _stonkLaneSet();
+        address lens = _launchpadAddress("SAFE_LAUNCH_LENS_V2");
+
+        vm.startBroadcast();
+        (, address deployer,) = vm.readCallers();
+        console.log("Deployer:", deployer);
+        console.log("Chain ID:", block.chainid);
+
+        stonkAdapter = new StonkLaunchAdapter(quotes, pads, lens);
+
+        bool ownsRegistry = registry != address(0) && TierRegistry(registry).owner() == deployer;
+        if (ownsRegistry && !TierRegistry(registry).isCounterpartyAllowed(address(stonkAdapter))) {
+            TierRegistry(registry).setCounterpartyAllowed(address(stonkAdapter), true);
+        }
+
+        vm.stopBroadcast();
+
+        bytes32 padSetHash = stonkAdapter.padSetHash();
+        require(padSetHash == keccak256(abi.encode(quotes, pads)), "new adapter padSetHash does not match the book");
+        if (replaces.code.length != 0) {
+            // Same lanes as the adapter it replaces: a redeploy fixes code, it
+            // does not re-route launches.
+            require(
+                StonkLaunchAdapter(replaces).padSetHash() == padSetHash,
+                "new adapter's lanes differ from the adapter it replaces"
+            );
+        }
+
+        console.log("StonkLaunchAdapter (new):", address(stonkAdapter));
+        console.log("Replaces:                ", replaces);
+        console.log("padSetHash:");
+        console.logBytes32(padSetHash);
+        if (ownsRegistry) {
+            console.log("Granted on TierRegistry", registry);
+        } else {
+            console.log("OWNER STEP OWED on TierRegistry", registry);
+            console.log("  setCounterpartyAllowed(new, true):");
+            console.logBytes(abi.encodeCall(TierRegistry.setCounterpartyAllowed, (address(stonkAdapter), true)));
+        }
+        if (replaces != address(0) && replaces != address(stonkAdapter)) {
+            console.log("NOT SENT: revoke the old adapter once no unexecuted proposal binds it:");
+            console.log("  setCounterpartyAllowed(old, false):");
+            console.logBytes(abi.encodeCall(TierRegistry.setCounterpartyAllowed, (replaces, false)));
+        }
+
+        _recordAddress("STONK_LAUNCH_ADAPTER", address(stonkAdapter));
+        vm.serializeUint("stonkRedeploy", "block", block.number);
+        vm.serializeAddress("stonkRedeploy", "deployer", deployer);
+        vm.serializeAddress("stonkRedeploy", "replaces", replaces);
+        vm.serializeAddress("stonkRedeploy", "tierRegistry", registry);
+        vm.serializeBytes32("stonkRedeploy", "padSetHash", padSetHash);
+        _recordMeta("stonkRedeploy", vm.serializeBool("stonkRedeploy", "granted", ownsRegistry));
     }
 
     /// @dev Every address this ceremony vouches for, adapters first.

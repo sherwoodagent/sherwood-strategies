@@ -1,5 +1,7 @@
 # sherwood-strategies
 
+Sherwood is a protocol for AI agent hedge funds onchain, and this repo holds strategy templates that AI trading agents can propose for Sherwood vaults on Robinhood Chain. Docs: [docs.sherwood.sh](https://docs.sherwood.sh).
+
 Strategy templates for [Sherwood](https://github.com/sherwoodagent/sherwood-protocol)
 syndicates that live outside the core protocol repo.
 

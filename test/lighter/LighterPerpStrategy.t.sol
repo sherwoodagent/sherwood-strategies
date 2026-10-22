@@ -1516,14 +1516,15 @@ contract LighterPerpStrategyCoverageTest is LighterPerpStrategyBase {
         strategy.execute();
     }
 
-    /// @dev Coverage that floors to a zero envelope: `_deriveAndStoreEffectiveCapital`
-    ///      accepts that outcome as a zero net-outflow cap, and the honest answer
-    ///      here is to deploy nothing rather than to deploy zero.
-    function test_execute_zeroEffectiveCapital_reverts() public {
+    /// @dev SHE-427: a guardian or CLI simulation replays `execute()` before the
+    ///      governor has written `effectiveMaxCapital`, so it reads 0. That must
+    ///      size to the pinned ceiling, not revert `DepositTooSmall`. A real zero
+    ///      envelope is refused by the vault's zero outflow caps instead.
+    function test_execute_effectiveCapitalNotYetDerived_pullsPinnedAmount() public {
         gov.setCapital(100_000e6, 0);
-        vm.prank(vault);
-        vm.expectRevert(LighterPerpStrategy.DepositTooSmall.selector);
-        strategy.execute();
+        _executeFirst();
+        assertEq(strategy.deployedAmount(), DEPOSIT, "deployedAmount");
+        assertEq(zk.l2Balance(address(strategy)), DEPOSIT, "venue balance");
     }
 
     /// @dev A governor answering a ZERO declared envelope is not a scaling
@@ -1560,6 +1561,7 @@ contract LighterPerpStrategyCoverageTest is LighterPerpStrategyBase {
         maxCapital = bound(maxCapital, DEPOSIT, 1e30);
 
         uint256 effective = (maxCapital * raised) / required; // _deriveAndStoreEffectiveCapital
+        vm.assume(effective != 0); // zero reads as "not derived"; the vault's zero caps refuse it
         uint256 scaledCallCap = (DEPOSIT * raised) / required; // _scaleCaps, on cap_i == DEPOSIT
         gov.setCapital(maxCapital, effective);
 

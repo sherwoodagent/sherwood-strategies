@@ -853,7 +853,8 @@ contract LighterPerpStrategy is BaseStrategy {
     ///
     ///      DEGRADES TO THE PINNED AMOUNT, and only there. An unresolvable
     ///      governor, one that does not answer either getter, a zero declared
-    ///      envelope, or an effective capital at or above the declared one all
+    ///      envelope, a zero effective capital (not yet derived), or an
+    ///      effective capital at or above the declared one all
     ///      mean "nothing scaled this proposal" — and a governor that does not
     ///      scale the envelope does not scale the caps either, so the pinned
     ///      pull is exactly what such a batch expects. Every v1 governor answers
@@ -875,7 +876,10 @@ contract LighterPerpStrategy is BaseStrategy {
         if (!okMax || declared == 0) return pinned;
         (bool okEff, uint256 effective) =
             _readUint(governor_, abi.encodeCall(ISyndicateGovernor.getEffectiveMaxCapital, (pid)));
-        if (!okEff || effective >= declared) return pinned;
+        // Zero means "not derived yet": the governor only writes it inside
+        // `executeProposal`, so a standalone simulation reads 0 (SHE-427). A real
+        // zero envelope still fails closed at the vault's zero outflow caps.
+        if (!okEff || effective == 0 || effective >= declared) return pinned;
 
         // `mulDiv` rather than `*` then `/`: the product is bounded in practice
         // (`pinned <= type(uint64).max`) but `declared` is proposer input, and a

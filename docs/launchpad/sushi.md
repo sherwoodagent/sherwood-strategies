@@ -156,12 +156,14 @@ a hostile encoding with a loose `minQuoteOut` can extract the whole swap
 notional, so the CLI rules and guardian review hold it. Tier 0 and tier 1 are
 priced identically by the governor; the bps is the operative number.
 
-Status (2026-10-22): proposed for the redeployed template
-`0x1F8221c4…0Df32` (codehash
-`0xf9abcebf1e6072b88a75d10558eaef22c00e7ba0ac8dc4ffaea867cee2f2c1e4`), both
-selectors, certifiable from 2026-10-25 19:05 UTC (14-day window). The proposals
-made on 2026-10-20 for the first template are moot and are left to expire.
-Until `certifyClass` lands, a launch prices at tier 2.
+Status (2026-10-27): certified. `certifyClass` landed for the redeployed
+template `0x1F8221c4…0Df32` (codehash
+`0xf9abcebf1e6072b88a75d10558eaef22c00e7ba0ac8dc4ffaea867cee2f2c1e4`) on
+2026-10-27 15:49 UTC, both selectors (execute tx `0x319d8f5f…55d6`, settle tx
+`0xbf3967d8…d50f`); `classTierOf` reads tier 0, 3,500 bps for each. A launch
+now prices at tier 0: coverage and the proposer bond are sized on 35% of
+`assetIn`. The proposals made on 2026-10-20 for the first template are moot
+and are left to expire.
 
 1. `new SushiLaunchAdapter(0xF1716eBf85836ffE2985db9A50dd29e5814caBe9)`. The
    constructor reads `WETH()` from the venue and locks the implementation's

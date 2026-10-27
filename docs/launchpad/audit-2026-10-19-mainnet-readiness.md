@@ -439,7 +439,8 @@ Nothing here is an audit claim; the template and adapters are readiness-reviewed
   `_updateParams` (`DeadlineInPast`, #14). A clone that can never execute is no longer creatable.
 - The template was redeployed at `0x1F8221c4176B8B017A6Ef699947BB4A33730Df32` (block 95,339,932,
   `redeploySushiTemplate()`, #17); the first template is un-approved. Class certification was proposed again
-  for the new codehash (`0xf9abcebf…c1e4`), tier 0, 3,500 bps, certifiable from 2026-10-25 19:05 UTC.
+  for the new codehash (`0xf9abcebf…c1e4`), tier 0, 3,500 bps, and landed on 2026-10-27 15:49 UTC for both
+  selectors (`classTierOf` reads 0 / 3,500).
 - The disarm design is dropped (sherwood#700, CLI 0.99.3): a non-asset-quoted launch is proposed with a live
   deadline and is executable as voted; `launchpad arm` is optional tightening. The stale-floor window the
   disarm closed is now bounded by the floor off the adapter's quote, the thin-pool refusal and the 3,500 bps

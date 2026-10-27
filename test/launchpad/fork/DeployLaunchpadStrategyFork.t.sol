@@ -565,21 +565,34 @@ contract DeployLaunchpadStrategyForkTest is Test {
 
     // ── the Stonk fast-follow on a Sushi-only chain ──
 
-    /// @notice `runStonk()` completes on a 4663 fork against the real book and
-    ///         the live registry: one Stonk adapter over the book's eight V2
-    ///         lanes is deployed and nothing else (no template, no Sushi
-    ///         adapter). The live registry is the Safe's, so nothing is granted,
-    ///         and a test run writes no book.
+    /// @notice `runStonk()` on a 4663 fork against the real book and the live
+    ///         registry. Before the fast-follow is broadcast the book has no
+    ///         Stonk adapter and the ceremony completes: one Stonk adapter over
+    ///         the book's eight V2 lanes is deployed and nothing else (no
+    ///         template, no Sushi adapter, one transaction). The live registry
+    ///         is owned by the deployer EOA, not the test's broadcaster, so
+    ///         nothing is granted. Once the broadcast's book is committed the
+    ///         same call must refuse (a second adapter is `redeployStonk()`'s
+    ///         job), so the test asserts whichever leg the committed book is on.
     function test_runStonk_fastFollowCompletesOnA4663Fork() public {
         _skipIfNoFork();
 
         DeployLaunchpadHarness harness = new DeployLaunchpadHarness();
         DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
         bytes32 bookBefore = _bookHash(script);
+
+        if (_committedBookHolds(script, "STONK_LAUNCH_ADAPTER")) {
+            vm.expectRevert(bytes("book already holds STONK_LAUNCH_ADAPTER: use --sig 'redeployStonk()'"));
+            script.runStonk();
+            return;
+        }
+
+        uint64 nonce = vm.getNonce(_broadcaster());
         script.runStonk();
 
         address stonk = address(script.stonkAdapter());
         assertTrue(stonk.code.length != 0, "Stonk adapter deployed");
+        assertEq(vm.getNonce(_broadcaster()), nonce + 1, "only the create was broadcast");
         assertEq(StonkLaunchAdapter(stonk).implementation(), stonk, "the deployed Stonk adapter IS the implementation");
         (address[] memory quotes, address[] memory pads) = harness.exposed_stonkLaneSet();
         assertEq(
@@ -592,6 +605,10 @@ contract DeployLaunchpadStrategyForkTest is Test {
 
         TierRegistry live = TierRegistry(0x4614f058920941A0a9a852e62485fbDE692D75E1);
         assertFalse(live.isCounterpartyAllowed(stonk), "no grant without ownership");
+        for (uint256 i; i < LANES.length; ++i) {
+            assertFalse(live.isCounterpartyAllowed(_bookPad(LANES[i])), "no pad grant without ownership");
+        }
+        assertFalse(live.isCounterpartyAllowed(_bookAddress("SAFE_LAUNCH_LENS_V2")), "no lens grant without ownership");
         assertEq(_bookHash(script), bookBefore, "a test run wrote the deployments book");
     }
 
@@ -884,6 +901,13 @@ contract DeployLaunchpadStrategyForkTest is Test {
     function _bookHash(DeployLaunchpadStrategy script) internal view returns (bytes32) {
         string memory path = script.deploymentsPath(block.chainid);
         return vm.exists(path) ? keccak256(bytes(vm.readFile(path))) : bytes32(0);
+    }
+
+    /// @dev Whether this chain's committed deployments book names `key`.
+    function _committedBookHolds(DeployLaunchpadStrategy script, string memory key) internal view returns (bool) {
+        string memory path = script.deploymentsPath(block.chainid);
+        if (!vm.exists(path)) return false;
+        return vm.keyExistsJson(vm.readFile(path), string.concat(".", key));
     }
 
     /// @dev A real v1 `TierRegistry` and `StrategyFactory`, both owned by

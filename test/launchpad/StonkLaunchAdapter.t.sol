@@ -128,6 +128,28 @@ contract StonkLaunchAdapterTest is Test {
         );
     }
 
+    /// @dev The dev-buy shape: `_venueData()` with `bufferSecs: 0` and nothing
+    ///      else changed. A launch that carries a dev buy must set no opening
+    ///      buffer (readiness F-4), so every buying fixture uses this one.
+    function _devBuyVenueData() internal pure returns (bytes memory) {
+        return abi.encode(
+            StonkLaunchAdapter.VenueData({
+                supply: SUPPLY,
+                startMcapUsd8: 1e11,
+                gradMcapUsd8: 5e12,
+                startTaxBps: 1000,
+                taxDecayPerMinuteBps: 100,
+                sellsEnabled: true,
+                bufferSecs: 0,
+                unsoldMode: 0,
+                openEnded: false,
+                postTaxBps: 0,
+                bondVenue: 0,
+                maxBuyPpm: 10_000
+            })
+        );
+    }
+
     /// @dev The open-ended shape: zero tax, no closing deadline at all.
     function _openEndedVenueData() internal pure returns (bytes memory) {
         return abi.encode(
@@ -190,6 +212,17 @@ contract StonkLaunchAdapterTest is Test {
         res = adapter.launch(_params(address(weth), quoteIn, minOut, reserve, _venueData()));
     }
 
+    /// @dev `_launch` with a dev buy: encodes `_devBuyVenueData()` (no buffer).
+    function _launchWithBuy(uint256 quoteIn, uint256 minOut, uint256 reserve)
+        internal
+        returns (ILaunchAdapter.LaunchResult memory res)
+    {
+        vm.prank(address(strategy));
+        weth.approve(address(adapter), quoteIn);
+        vm.prank(address(strategy));
+        res = adapter.launch(_params(address(weth), quoteIn, minOut, reserve, _devBuyVenueData()));
+    }
+
     function _clone(ILaunchAdapter.LaunchResult memory res) internal pure returns (StonkLaunchAdapter) {
         return StonkLaunchAdapter(address(uint160(uint256(res.launchRef))));
     }
@@ -221,7 +254,7 @@ contract StonkLaunchAdapterTest is Test {
     }
 
     function test_Launch_DevBuyIsDeliveredStraightToTheStrategy() public {
-        ILaunchAdapter.LaunchResult memory res = _launch(QUOTE_IN, QUOTE_IN, RESERVE);
+        ILaunchAdapter.LaunchResult memory res = _launchWithBuy(QUOTE_IN, QUOTE_IN, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
 
         // rate 1e18: 10 quote -> 10 tokens, delivered by the pad to the owner.
@@ -251,7 +284,7 @@ contract StonkLaunchAdapterTest is Test {
         uint256 creatorFee = (QUOTE_IN * wethPad.CREATOR_FEE_BPS()) / 10_000;
         assertGt(creatorFee, 0, "the fixture must actually push a creator fee, or it proves nothing");
 
-        ILaunchAdapter.LaunchResult memory res = _launch(QUOTE_IN, QUOTE_IN, RESERVE);
+        ILaunchAdapter.LaunchResult memory res = _launchWithBuy(QUOTE_IN, QUOTE_IN, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
 
         assertEq(res.quoteSpent, QUOTE_IN, "the buy consumed the whole budget; fee income is not unspent quote");
@@ -275,7 +308,7 @@ contract StonkLaunchAdapterTest is Test {
         vm.expectEmit(true, false, false, true);
         emit StonkLaunchAdapter.FeesCollected(vault, creatorFee, 0);
         vm.prank(address(strategy));
-        adapter.launch(_params(address(weth), QUOTE_IN, QUOTE_IN, RESERVE, _venueData()));
+        adapter.launch(_params(address(weth), QUOTE_IN, QUOTE_IN, RESERVE, _devBuyVenueData()));
     }
 
     /// @dev The zero-buy case still reports ZERO: no trade, no fee, nothing to
@@ -291,7 +324,7 @@ contract StonkLaunchAdapterTest is Test {
     }
 
     function test_Launch_NeverSetsEoaOnly() public {
-        ILaunchAdapter.LaunchResult memory res = _launch(QUOTE_IN, 0, RESERVE);
+        ILaunchAdapter.LaunchResult memory res = _launchWithBuy(QUOTE_IN, QUOTE_IN, RESERVE);
         assertFalse(wethPad.modesOf(_clone(res).launchId()).eoaOnly, "eoaOnly is never set");
         // And it is not a parameter the caller could smuggle in: `VenueData`
         // carries no such field.
@@ -359,6 +392,26 @@ contract StonkLaunchAdapterTest is Test {
         vm.prank(address(strategy));
         vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.MinOutWithoutBuy.selector, 1));
         adapter.launch(_params(address(weth), 0, 1, RESERVE, _venueData()));
+    }
+
+    function test_RevertWhen_DevBuyHasNoFloor_NoFundsMove() public {
+        uint256 before = weth.balanceOf(address(strategy));
+        vm.prank(address(strategy));
+        weth.approve(address(adapter), QUOTE_IN);
+        vm.prank(address(strategy));
+        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.DevBuyWithoutFloor.selector, QUOTE_IN));
+        adapter.launch(_params(address(weth), QUOTE_IN, 0, RESERVE, _devBuyVenueData()));
+        assertEq(weth.balanceOf(address(strategy)), before, "no quote moved");
+    }
+
+    function test_RevertWhen_DevBuyInsideTheOpeningBuffer_NoFundsMove() public {
+        uint256 before = weth.balanceOf(address(strategy));
+        vm.prank(address(strategy));
+        weth.approve(address(adapter), QUOTE_IN);
+        vm.prank(address(strategy));
+        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.DevBuyInsideBuffer.selector, uint32(60)));
+        adapter.launch(_params(address(weth), QUOTE_IN, QUOTE_IN, RESERVE, _venueData()));
+        assertEq(weth.balanceOf(address(strategy)), before, "no quote moved");
     }
 
     function test_RevertWhen_DeadlineHasPassed() public {
@@ -948,7 +1001,7 @@ contract StonkLaunchAdapterTest is Test {
     }
 
     function test_RevertWhen_AbortIsRefusedByTheVenue() public {
-        ILaunchAdapter.LaunchResult memory res = _launch(QUOTE_IN, 0, RESERVE);
+        ILaunchAdapter.LaunchResult memory res = _launchWithBuy(QUOTE_IN, QUOTE_IN, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
         // A buy happened, so the venue bars the recovery lever — and the owner
         // gets the venue's answer rather than a silent no-op.
@@ -985,7 +1038,7 @@ contract StonkLaunchAdapterTest is Test {
         vm.prank(address(strategy));
         // The venue's own revert, not one of ours: no bypass, no stale-priced retry.
         vm.expectRevert(MockStonkPad.StalePrice.selector);
-        adapter.launch(_params(address(stonk), QUOTE_IN, 0, RESERVE, _venueData()));
+        adapter.launch(_params(address(stonk), QUOTE_IN, 1, RESERVE, _devBuyVenueData()));
     }
 
     function test_Launch_OnTheStockLaneOnceTheOracleRecovers() public {
@@ -994,7 +1047,7 @@ contract StonkLaunchAdapterTest is Test {
         stonk.approve(address(adapter), QUOTE_IN);
         vm.prank(address(strategy));
         ILaunchAdapter.LaunchResult memory res =
-            adapter.launch(_params(address(stonk), QUOTE_IN, QUOTE_IN, RESERVE, _venueData()));
+            adapter.launch(_params(address(stonk), QUOTE_IN, QUOTE_IN, RESERVE, _devBuyVenueData()));
 
         assertEq(_clone(res).pad(), address(stonkPad), "routed to the STONK lane");
         assertEq(IERC20(res.token).balanceOf(address(strategy)), RESERVE + QUOTE_IN);

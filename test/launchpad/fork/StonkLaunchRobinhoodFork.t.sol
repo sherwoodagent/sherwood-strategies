@@ -557,6 +557,74 @@ contract StonkLaunchRobinhoodForkTest is Test {
         assertTrue(IStonkSafeLaunchpadV2(PAD_V2_WETH).getLaunch(id).bonded, "the locked LP was never minted");
     }
 
+    /// @notice F-4 on the live WETH pad: a dev buy is refused while a buffer is
+    ///         set, and with `bufferSecs == 0` the same buy fills at the curve's
+    ///         opening tax, not the 99.99% shield. Also the proof that the venue
+    ///         accepts a zero buffer on a windowed curve.
+    function test_fork_adapterDevBuy_refusedInsideTheBufferAndFilledAtTheOpeningTax() public {
+        _skipIfNoFork();
+
+        address[] memory quotes = new address[](1);
+        address[] memory pads = new address[](1);
+        quotes[0] = WETH;
+        pads[0] = PAD_V2_WETH;
+        StonkLaunchAdapter adapter = new StonkLaunchAdapter(quotes, pads, LENS);
+
+        // This contract stands in for the owning strategy and pays the dev buy.
+        _fundWeth(address(this), 0.05 ether);
+        IWETH9(WETH).approve(address(adapter), 0.05 ether);
+
+        StonkLaunchAdapter.VenueData memory v = StonkLaunchAdapter.VenueData({
+            supply: SUPPLY,
+            startMcapUsd8: START_MCAP_USD8,
+            gradMcapUsd8: GRAD_MCAP_USD8,
+            startTaxBps: START_TAX_BPS,
+            taxDecayPerMinuteBps: DECAY_BPS_PER_MIN,
+            sellsEnabled: true,
+            bufferSecs: BUFFER_SECS,
+            unsoldMode: 0,
+            openEnded: false,
+            postTaxBps: 0,
+            bondVenue: 0,
+            maxBuyPpm: 0
+        });
+        ILaunchAdapter.LaunchParams memory p = ILaunchAdapter.LaunchParams({
+            name: "Sherwood Fork Probe",
+            symbol: "SFP",
+            quoteToken: WETH,
+            quoteIn: 0.05 ether,
+            minTokensOut: 1,
+            reserveAmount: SUPPLY / 10,
+            deadline: 0,
+            feeRecipient: feeSink,
+            venueData: abi.encode(v)
+        });
+
+        // ── (a) With a buffer the dev buy would pay the shield: refused. ──
+        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.DevBuyInsideBuffer.selector, BUFFER_SECS));
+        adapter.launch(p);
+
+        // ── (b) Same buy, zero buffer: the venue accepts it and it fills. ──
+        v.bufferSecs = 0;
+        p.venueData = abi.encode(v);
+        ILaunchAdapter.LaunchResult memory r = adapter.launch(p);
+
+        uint256 id = StonkLaunchAdapter(address(uint160(uint256(r.launchRef)))).launchId();
+        uint256 tax = IStonkPadProbe(PAD_V2_WETH).currentTaxBps(id);
+        uint256 bought = IStonkPadProbe(PAD_V2_WETH).boughtOf(id, address(this));
+        console2.log("currentTaxBps", tax);
+        console2.log("boughtOf(owner)", bought);
+        console2.log("reserveHeld", r.reserveHeld);
+        console2.log("SUPPLY / 10", SUPPLY / 10);
+
+        assertEq(IStonkPadProbe(PAD_V2_WETH).bufferSecsOf(id), 0, "the venue recorded a zero buffer");
+        assertEq(r.quoteSpent, 0.05 ether, "the dev buy consumed the whole budget");
+        assertGt(r.reserveHeld, SUPPLY / 10, "the dev buy did not land on the owner on top of the reserve");
+        assertGt(bought, 0, "the pad recorded no buy for the owner");
+        assertLe(tax, START_TAX_BPS, "the dev buy is above the curve's opening tax");
+        assertTrue(tax != IStonkPadProbe(PAD_V2_WETH).BUFFER_TAX_BPS(), "the dev buy paid the anti-snipe shield");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // TASK 0.3 — bring-your-own token on a V2 pad vs a V3 pad
     // ─────────────────────────────────────────────────────────────────────────

@@ -67,8 +67,8 @@ interface IPositionManagerFactory {
  *     4. `StrategyFactory.setTemplateApproval(template, true)`. Without it
  *        `cloneAndInit` refuses the template outright.
  *   Steps 1, 2 and 4 are PERFORMED when the broadcaster owns the registry /
- *   factory (a fresh-deploy ceremony before ownership moves to the Safe), and
- *   otherwise PRINTED as Safe transactions with their calldata. Either way the
+ *   factory (as the deployer EOA does on 4663, see below), and otherwise
+ *   PRINTED as owner transactions with their calldata. Either way the
  *   post-deploy reads at the end say what is actually true on-chain.
  *
  *   ADDRESSES. Protocol-owned keys (`TIER_REGISTRY`, `STRATEGY_FACTORY`,
@@ -127,10 +127,13 @@ interface IPositionManagerFactory {
  *   Verify afterwards (`verify()` on the fork, `verifySushi()` on mainnet):
  *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
  *       --rpc-url <same> --sig 'verifySushi()'
- *   On 4663 the deployer does not own the registry or the factory (the Safe
- *   `0x5A00afAecE9CF61A768E2AE2713084C8d354DF94` does), so the two grants and
- *   the template approval are PRINTED as Safe transactions with calldata, and
- *   `verifySushi()` fails until the Safe has executed them.
+ *   On 4663 the deployer EOA `0x5A00afAecE9CF61A768E2AE2713084C8d354DF94`
+ *   (keystore `sherwood-agent`) owns both the TierRegistry and the
+ *   StrategyFactory, so the grants and the template approval are PERFORMED in
+ *   the same run; every 4663 ceremony so far did so
+ *   (`_meta.launchpad.ownerStepsComplete` is `true`). A broadcaster that does
+ *   not own them gets them PRINTED as owner transactions with calldata
+ *   instead, and `verifySushi()` fails until the owner has executed them.
  *
  *   STONK FAST-FOLLOW on a Sushi-only chain: `--sig 'runStonk()'`. The
  *   readiness review's F-4 is applied to `StonkLaunchAdapter` (a dev buy is

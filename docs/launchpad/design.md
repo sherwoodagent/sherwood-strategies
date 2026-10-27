@@ -402,11 +402,12 @@ template and the Sushi adapter, grants `[sushiAdapter, Sushi proxy]` with
 `setCounterpartyAllowed`, and approves the template with
 `StrategyFactory.setTemplateApproval`; `--sig 'verifySushi()'` checks it. The
 full `run()`, which also deploys the Stonk adapter and grants it, its eight V2
-pads and the lens, is the fork ceremony (chain 9994663). Stonk is not deployed
-or granted on 4663; its code stays in the tree, fork-only. The Stonk
-fast-follow path: apply F-4 (`docs/launchpad/audit-2026-10-19-mainnet-readiness.md`)
-first, then deploy the Stonk adapter and grant the adapter, the eight V2 pads
-and the lens against the already-recorded template, then run `verify()`.
+pads and the lens, is the fork ceremony (chain 9994663). F-4
+(`docs/launchpad/audit-2026-10-19-mainnet-readiness.md`) is applied, and
+`--sig 'runStonk()'` is the Stonk fast-follow on 4663: it deploys the Stonk
+adapter and grants it, the eight V2 pads and the lens, leaves the template
+untouched, and `verify()` checks the chain afterwards (`docs/launchpad/stonk.md`).
+At writing (2026-10-27) the Stonk adapter is not yet deployed on 4663.
 
 Both ceremonies perform the owner writes when the broadcaster owns the registry
 and factory and print them as Safe transactions otherwise. The protocol's own

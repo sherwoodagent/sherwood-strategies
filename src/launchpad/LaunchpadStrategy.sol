@@ -975,6 +975,9 @@ contract LaunchpadStrategy is BaseStrategy {
     function claimable(address holder) external view returns (uint256) {
         if (_state != State.Executed) return 0;
         if (claimed[holder]) return 0;
+        // Mirrors `_claim`'s `QueueCannotClaim`: the queue's slice is never paid to it.
+        address queue = _readAddress(vault(), abi.encodeCall(IVaultVotes.withdrawalQueue, ()));
+        if (queue != address(0) && holder == queue) return 0;
         uint256 total = IVaultVotes(vault()).getPastTotalSupply(snap);
         if (total == 0) return 0;
         return Math.mulDiv(reserve, IVaultVotes(vault()).getPastVotes(holder, snap), total);

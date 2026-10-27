@@ -22,9 +22,9 @@ interface IPositionManagerFactory {
  *         mainnet (chain 4663), and bring them to the state protocol v1 needs
  *         before any vault can use them.
  *
- *   TWO CEREMONIES. `run()` is the full one: template, Stonk adapter, Sushi
- *   adapter, twelve grants. `runSushi()` is the SUSHI-ONLY one: template and
- *   Sushi adapter, two grants. Mainnet 4663 ships Sushi only (readiness review
+ *   TWO CEREMONIES, PLUS A FAST-FOLLOW. `run()` is the full one: template,
+ *   Stonk adapter, Sushi adapter, twelve grants. `runSushi()` is the
+ *   SUSHI-ONLY one: template and Sushi adapter, two grants. Mainnet 4663 ships Sushi only (readiness review
  *   `docs/launchpad/audit-2026-10-19-mainnet-readiness.md`, section 5
  *   decision 1), so `runSushi()` is the 4663 ceremony and `run()` is the
  *   9994663 fork ceremony, where Stonk is already live; `run()` REFUSES
@@ -33,8 +33,9 @@ interface IPositionManagerFactory {
  *   that already holds `STONK_LAUNCH_ADAPTER`, since it would rewrite
  *   `_meta.launchpad` without the pad-set hash. `verify()` requires
  *   every Stonk counterparty and fails a Sushi-only deployment by design; use
- *   `verifySushi()` there. Adding Stonk to a Sushi-only chain later is a
- *   fast-follow with its own ceremony (see `STONK FAST-FOLLOW` below).
+ *   `verifySushi()` there. Adding Stonk to a Sushi-only chain later is the
+ *   fast-follow `runStonk()`: Stonk adapter, eight pads and lens, ten grants,
+ *   template untouched (see `STONK FAST-FOLLOW` below).
  *
  *   MAINNET-ONLY BY CONSTRUCTION. The venues exist on 4663 and nowhere else,
  *   so the script refuses any other chain rather than deploying a template
@@ -93,7 +94,9 @@ interface IPositionManagerFactory {
  *   repo's book, `deployments/<chainid>.json`, as `LAUNCHPAD_TEMPLATE`,
  *   `SUSHI_LAUNCH_ADAPTER` and (full ceremony only) `STONK_LAUNCH_ADAPTER`,
  *   with the `padSetHash` (full ceremony only) and the Sushi implementation
- *   slot under `_meta.launchpad` (see `DeploymentsBook`). `--sig 'verify()'`
+ *   slot under `_meta.launchpad` (see `DeploymentsBook`). The Stonk
+ *   fast-follow records `STONK_LAUNCH_ADAPTER` and its own section,
+ *   `_meta.stonkFastFollow`, never `_meta.launchpad`. `--sig 'verify()'`
  *   or `--sig 'verifySushi()'` re-reads them and checks the deployment against
  *   the chain without redeploying.
  *
@@ -129,17 +132,30 @@ interface IPositionManagerFactory {
  *   the template approval are PRINTED as Safe transactions with calldata, and
  *   `verifySushi()` fails until the Safe has executed them.
  *
- *   STONK FAST-FOLLOW on a Sushi-only chain. Not a script entry point yet, on
- *   purpose: the readiness review's F-4 (dev buy at the opening tax) is to be
- *   applied to `StonkLaunchAdapter` first, and the Stonk fork suite re-run.
- *   The ceremony is then: deploy `new StonkLaunchAdapter(quotes, pads, lens)`
- *   over `_stonkLaneSet()`, grant the adapter, the eight V2 pads and the lens
- *   (`setCounterpartyAllowed`, printed for the Safe), record
- *   `STONK_LAUNCH_ADAPTER` and `_meta.launchpad.stonkPadSetHash`, and switch
- *   the chain to `verify()`. The template needs no change and no re-approval:
- *   it binds any granted adapter at clone-init. `redeployStonkAdapter` already
- *   has the adapter half of that ceremony; the pad and lens grants are the
- *   other half.
+ *   STONK FAST-FOLLOW on a Sushi-only chain: `--sig 'runStonk()'`. The
+ *   readiness review's F-4 is applied to `StonkLaunchAdapter` (a dev buy is
+ *   refused inside the opening buffer or without a `minTokensOut` floor) and
+ *   the Stonk fork suite re-run. The ceremony deploys `new StonkLaunchAdapter(quotes, pads, lens)`
+ *   over `_stonkLaneSet()`, grants the adapter, the eight V2 pads and the lens
+ *   (`setCounterpartyAllowed`, performed when the broadcaster owns the
+ *   registry, printed as owner transactions otherwise), and records
+ *   `STONK_LAUNCH_ADAPTER` and `_meta.stonkFastFollow` (`block`, `deployer`,
+ *   `tierRegistry`, `lens`, `padSetHash`, `granted`). The template needs no
+ *   change, no re-approval and no new class certification: it binds any
+ *   granted adapter at clone-init, and the certification is keyed to the
+ *   template's codehash and selector, neither of which changes. The Sushi
+ *   adapter and its grants are untouched. It refuses a book that already
+ *   holds `STONK_LAUNCH_ADAPTER` (use `redeployStonk()`) and one without the
+ *   Sushi-only deployment. Afterwards the chain is checked with `verify()`,
+ *   which now applies in place of `verifySushi()`.
+ *   Usage — Robinhood mainnet (4663), STONK FAST-FOLLOW (dry run first, without
+ *   `--broadcast`, and paste the printed runbook into the PR):
+ *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
+ *       --rpc-url robinhood --account sherwood-agent \
+ *       --sender 0x5A00afAecE9CF61A768E2AE2713084C8d354DF94 --broadcast --slow --sig 'runStonk()'
+ *   Verify afterwards:
+ *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
+ *       --rpc-url <same> --sig 'verify()'
  *
  *   REPLACING ONLY THE STONK ADAPTER (a fix to `StonkLaunchAdapter`):
  *     forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
@@ -542,6 +558,92 @@ contract DeployLaunchpadStrategy is DeploymentsBook {
         _recordMeta("stonkRedeploy", vm.serializeBool("stonkRedeploy", "granted", ownsRegistry));
     }
 
+    /// @notice The STONK FAST-FOLLOW on a Sushi-only chain: `--sig 'runStonk()'`.
+    ///         Deploys one `StonkLaunchAdapter` over the book's eight V2 lanes and
+    ///         grants the adapter, the eight pads and the lens (see `deployStonk`).
+    ///         The template needs no change, no re-approval and no new class
+    ///         certification: it binds any granted adapter at clone-init, and
+    ///         the certification is keyed to the template's codehash and
+    ///         selector, neither of which this run touches. Afterwards the chain
+    ///         is checked with `verify()`, not `verifySushi()`.
+    /// @dev    Refuses a book that already holds `STONK_LAUNCH_ADAPTER` (a
+    ///         second adapter would silently sit beside the first; replacing it
+    ///         is `redeployStonk()`), and a book without the Sushi-only
+    ///         ceremony's `LAUNCHPAD_TEMPLATE` and `SUSHI_LAUNCH_ADAPTER` (a
+    ///         fast-follow lands on a chain that already runs `runSushi()`).
+    function runStonk() external {
+        require(_isRobinhood(), "wrong chain: expected Robinhood mainnet 4663 or its 9994663 fork");
+        require(
+            _deployedAddress("STONK_LAUNCH_ADAPTER") == address(0),
+            "book already holds STONK_LAUNCH_ADAPTER: use --sig 'redeployStonk()'"
+        );
+        _requireDeployedAddress("LAUNCHPAD_TEMPLATE");
+        _requireDeployedAddress("SUSHI_LAUNCH_ADAPTER");
+        deployStonk(_protocolAddress("TIER_REGISTRY"));
+    }
+
+    /// @notice The Stonk fast-follow with the registry passed in. DEPLOYS
+    ///         `new StonkLaunchAdapter(quotes, pads, lens)` over `_stonkLaneSet()`
+    ///         and `SAFE_LAUNCH_LENS_V2`. GRANTS the adapter (after its deploy:
+    ///         codehash snapshot), the eight V2 pads and the lens when the
+    ///         broadcaster owns the registry, and otherwise prints the ten
+    ///         `setCounterpartyAllowed` calls as owner transactions. RECORDS
+    ///         `STONK_LAUNCH_ADAPTER` and `_meta.stonkFastFollow` (`block`,
+    ///         `deployer`, `tierRegistry`, `lens`, `padSetHash`, `granted`).
+    ///         DOES NOT TOUCH the template, its factory approval, the Sushi
+    ///         adapter, the Sushi grants, `_meta.launchpad`, or the class
+    ///         certification: the template needs no change, no re-approval and
+    ///         no new certification, since certification is keyed to the
+    ///         template's codehash and selector. `verify()` is the chain's check
+    ///         once the grants have landed.
+    /// @dev    Same split as `deploy`, for the same fork-rehearsal reason.
+    ///         Records under its own `_meta` section because `_recordMeta`
+    ///         replaces a section whole, and writing `_meta.launchpad` would drop
+    ///         the Sushi ceremony's `sushiLaunchpadImplementation`.
+    function deployStonk(address registry) public {
+        (address[] memory quotes, address[] memory pads) = _stonkLaneSet();
+        address lens = _launchpadAddress("SAFE_LAUNCH_LENS_V2");
+
+        vm.startBroadcast();
+        (, address deployer,) = vm.readCallers();
+        console.log("Deployer:", deployer);
+        console.log("Chain ID:", block.chainid);
+
+        stonkAdapter = new StonkLaunchAdapter(quotes, pads, lens);
+
+        address[] memory counterparties = _stonkCounterparties(address(stonkAdapter), pads, lens);
+        bool ownsRegistry = _grantIfOwner(registry, deployer, counterparties);
+
+        vm.stopBroadcast();
+
+        bytes32 padSetHash = stonkAdapter.padSetHash();
+        require(padSetHash == keccak256(abi.encode(quotes, pads)), "new adapter padSetHash does not match the book");
+
+        console.log("StonkLaunchAdapter:   ", address(stonkAdapter));
+        console.log("SafeLaunchLensV2:     ", lens);
+        console.log("StonkLaunchAdapter padSetHash (record with the grant):");
+        console.logBytes32(padSetHash);
+
+        console.log("");
+        console.log("== REGISTRY OWNER RUNBOOK (Stonk fast-follow) ==");
+        _printGrantRunbook(registry, counterparties, ownsRegistry);
+        console.log("");
+        console.log("== POST-DEPLOY VALIDATION READS (Stonk fast-follow) ==");
+        if (registry != address(0)) {
+            _printGrantValidation(registry, counterparties);
+        } else {
+            console.log("TIER_REGISTRY unresolved - verify the grants by hand");
+        }
+
+        _recordAddress("STONK_LAUNCH_ADAPTER", address(stonkAdapter));
+        vm.serializeUint("stonkFastFollow", "block", block.number);
+        vm.serializeAddress("stonkFastFollow", "deployer", deployer);
+        vm.serializeAddress("stonkFastFollow", "tierRegistry", registry);
+        vm.serializeAddress("stonkFastFollow", "lens", lens);
+        vm.serializeBytes32("stonkFastFollow", "padSetHash", padSetHash);
+        _recordMeta("stonkFastFollow", vm.serializeBool("stonkFastFollow", "granted", ownsRegistry));
+    }
+
     /// @dev Every address the FULL ceremony vouches for, adapters first.
     function _counterparties(address stonk, address[] memory pads, address lens, address sushi, address sushiLaunchpad)
         internal
@@ -678,20 +780,7 @@ contract DeployLaunchpadStrategy is DeploymentsBook {
     ) internal view {
         console.log("");
         console.log("== REGISTRY / FACTORY OWNER RUNBOOK ==");
-        if (ownsRegistry) {
-            console.log("TierRegistry grants PERFORMED by this run:", registry);
-        } else {
-            console.log("TierRegistry:", registry);
-            if (registry == address(0)) {
-                console.log(
-                    "  TIER_REGISTRY unresolved: set it in the env, the protocol book or script/launchpad/addresses-4663.json"
-                );
-            }
-            for (uint256 i; i < counterparties.length; ++i) {
-                console.log("  setCounterpartyAllowed(counterparty, true):", counterparties[i]);
-                console.logBytes(abi.encodeCall(TierRegistry.setCounterpartyAllowed, (counterparties[i], true)));
-            }
-        }
+        _printGrantRunbook(registry, counterparties, ownsRegistry);
         if (ownsFactory) {
             console.log("StrategyFactory template approval PERFORMED by this run:", factory);
         } else {
@@ -712,13 +801,7 @@ contract DeployLaunchpadStrategy is DeploymentsBook {
         console.log("");
         console.log("== POST-DEPLOY VALIDATION READS ==");
         if (registry != address(0)) {
-            for (uint256 i; i < counterparties.length; ++i) {
-                console.log(
-                    counterparties[i],
-                    "isCounterpartyAllowed:",
-                    TierRegistry(registry).isCounterpartyAllowed(counterparties[i])
-                );
-            }
+            _printGrantValidation(registry, counterparties);
             address swapAdapter = _protocolAddress("UNISWAP_SWAP_ADAPTER");
             if (swapAdapter != address(0)) {
                 console.log(
@@ -732,6 +815,38 @@ contract DeployLaunchpadStrategy is DeploymentsBook {
             console.log("template approvedTemplate:", StrategyFactory(factory).approvedTemplate(address(template)));
         } else {
             console.log("STRATEGY_FACTORY unresolved - verify the template approval by hand");
+        }
+    }
+
+    /// @dev The registry half of the runbook: the grants this run performed,
+    ///      or each `setCounterpartyAllowed` as an owner transaction with its
+    ///      calldata. Shared by `_printRunbook` and the Stonk fast-follow.
+    function _printGrantRunbook(address registry, address[] memory counterparties, bool ownsRegistry) internal pure {
+        if (ownsRegistry) {
+            console.log("TierRegistry grants PERFORMED by this run:", registry);
+        } else {
+            console.log("TierRegistry:", registry);
+            if (registry == address(0)) {
+                console.log(
+                    "  TIER_REGISTRY unresolved: set it in the env, the protocol book or script/launchpad/addresses-4663.json"
+                );
+            }
+            for (uint256 i; i < counterparties.length; ++i) {
+                console.log("  setCounterpartyAllowed(counterparty, true):", counterparties[i]);
+                console.logBytes(abi.encodeCall(TierRegistry.setCounterpartyAllowed, (counterparties[i], true)));
+            }
+        }
+    }
+
+    /// @dev One `isCounterpartyAllowed` read per counterparty. `registry` must
+    ///      be nonzero. Shared by `_printValidation` and the Stonk fast-follow.
+    function _printGrantValidation(address registry, address[] memory counterparties) internal view {
+        for (uint256 i; i < counterparties.length; ++i) {
+            console.log(
+                counterparties[i],
+                "isCounterpartyAllowed:",
+                TierRegistry(registry).isCounterpartyAllowed(counterparties[i])
+            );
         }
     }
 

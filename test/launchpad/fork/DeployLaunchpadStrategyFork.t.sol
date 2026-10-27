@@ -563,6 +563,111 @@ contract DeployLaunchpadStrategyForkTest is Test {
         script.redeployStonk();
     }
 
+    // ── the Stonk fast-follow on a Sushi-only chain ──
+
+    /// @notice `runStonk()` completes on a 4663 fork against the real book and
+    ///         the live registry: one Stonk adapter over the book's eight V2
+    ///         lanes is deployed and nothing else (no template, no Sushi
+    ///         adapter). The live registry is the Safe's, so nothing is granted,
+    ///         and a test run writes no book.
+    function test_runStonk_fastFollowCompletesOnA4663Fork() public {
+        _skipIfNoFork();
+
+        DeployLaunchpadHarness harness = new DeployLaunchpadHarness();
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        bytes32 bookBefore = _bookHash(script);
+        script.runStonk();
+
+        address stonk = address(script.stonkAdapter());
+        assertTrue(stonk.code.length != 0, "Stonk adapter deployed");
+        assertEq(StonkLaunchAdapter(stonk).implementation(), stonk, "the deployed Stonk adapter IS the implementation");
+        (address[] memory quotes, address[] memory pads) = harness.exposed_stonkLaneSet();
+        assertEq(
+            StonkLaunchAdapter(stonk).padSetHash(),
+            keccak256(abi.encode(quotes, pads)),
+            "padSetHash is the book's lanes"
+        );
+        assertEq(address(script.template()), address(0), "no template deployed");
+        assertEq(address(script.sushiAdapter()), address(0), "no Sushi adapter deployed");
+
+        TierRegistry live = TierRegistry(0x4614f058920941A0a9a852e62485fbDE692D75E1);
+        assertFalse(live.isCounterpartyAllowed(stonk), "no grant without ownership");
+        assertEq(_bookHash(script), bookBefore, "a test run wrote the deployments book");
+    }
+
+    /// @notice Over a complete owned Sushi-only deployment, `deployStonk`
+    ///         performs exactly the Stonk half: the adapter, the eight V2 pads
+    ///         and the lens become allowed counterparties, the template and the
+    ///         Sushi adapter are untouched, and the chain then passes the FULL
+    ///         `verifyDeployment`.
+    function test_deployStonk_grantsTheStonkHalfWhenTheBroadcasterOwnsTheRegistry() public {
+        _skipIfNoFork();
+
+        (TierRegistry registry, StrategyFactory factory) = _ownedSingletons(_broadcaster());
+        vm.prank(_broadcaster());
+        registry.setStrategyFactory(address(factory));
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        bytes32 bookBefore = _bookHash(script);
+        script.deploySushi(address(registry), address(factory));
+        address template = address(script.template());
+        address sushi = address(script.sushiAdapter());
+
+        uint64 nonce = vm.getNonce(_broadcaster());
+        script.deployStonk(address(registry));
+        address stonk = address(script.stonkAdapter());
+
+        assertEq(stonk, vm.computeCreateAddress(_broadcaster(), nonce), "the adapter is the only create");
+        assertEq(vm.getNonce(_broadcaster()), nonce + 11, "one create, ten grants");
+        assertTrue(registry.isCounterpartyAllowed(stonk), "Stonk adapter granted");
+        for (uint256 i; i < LANES.length; ++i) {
+            assertTrue(registry.isCounterpartyAllowed(_bookPad(LANES[i])), "pad granted");
+        }
+        assertTrue(registry.isCounterpartyAllowed(_bookAddress("SAFE_LAUNCH_LENS_V2")), "lens granted");
+        assertEq(address(script.template()), template, "template untouched");
+        assertEq(address(script.sushiAdapter()), sushi, "Sushi adapter untouched");
+
+        script.verifyDeployment(address(registry), address(factory), template, stonk, sushi);
+        assertEq(_bookHash(script), bookBefore, "a test run wrote the deployments book");
+    }
+
+    /// @notice Without registry ownership the adapter is deployed but nothing
+    ///         is granted; the Safe executes the ten printed transactions.
+    function test_deployStonk_grantsNothingWhenTheBroadcasterDoesNotOwnTheRegistry() public {
+        _skipIfNoFork();
+
+        (TierRegistry registry,) = _ownedSingletons(makeAddr("ownerSafe"));
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        uint64 nonce = vm.getNonce(_broadcaster());
+        script.deployStonk(address(registry));
+
+        address stonk = address(script.stonkAdapter());
+        assertTrue(stonk.code.length != 0, "Stonk adapter deployed");
+        assertEq(vm.getNonce(_broadcaster()), nonce + 1, "only the create was broadcast");
+        assertFalse(registry.isCounterpartyAllowed(stonk), "no grant without ownership");
+        assertFalse(registry.isCounterpartyAllowed(_bookAddress("SAFE_LAUNCH_LENS_V2")), "no lens grant");
+    }
+
+    /// @notice A chain whose book already holds a Stonk adapter (the fork)
+    ///         refuses the fast-follow, which would add a second adapter, and
+    ///         points at `redeployStonk()`.
+    function test_runStonk_refusesABookThatAlreadyHoldsAStonkAdapter() public {
+        _skipIfNoFork();
+        vm.chainId(CHAIN_ROBINHOOD_FORK);
+
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        vm.expectRevert(bytes("book already holds STONK_LAUNCH_ADAPTER: use --sig 'redeployStonk()'"));
+        script.runStonk();
+    }
+
+    function test_runStonk_rejectsAWrongChainId() public {
+        _skipIfNoFork();
+        vm.chainId(1);
+
+        DeployLaunchpadStrategy script = new DeployLaunchpadStrategy();
+        vm.expectRevert(bytes("wrong chain: expected Robinhood mainnet 4663 or its 9994663 fork"));
+        script.runStonk();
+    }
+
     // ── replacing only the template ──
 
     /// @notice `redeployTemplate` over a complete owned Sushi-only deployment: a

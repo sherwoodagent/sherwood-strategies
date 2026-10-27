@@ -621,8 +621,9 @@ contract StonkLaunchRobinhoodForkTest is Test {
         assertEq(r.quoteSpent, 0.05 ether, "the dev buy consumed the whole budget");
         assertGt(r.reserveHeld, SUPPLY / 10, "the dev buy did not land on the owner on top of the reserve");
         assertGt(bought, 0, "the pad recorded no buy for the owner");
-        assertLe(tax, START_TAX_BPS, "the dev buy is above the curve's opening tax");
-        assertTrue(tax != IStonkPadProbe(PAD_V2_WETH).BUFFER_TAX_BPS(), "the dev buy paid the anti-snipe shield");
+        // Read in the buy's own block, no warp: elapsed is zero, so the tax
+        // is exactly the curve's opening tax, never the 99.99% shield.
+        assertEq(tax, START_TAX_BPS, "the dev buy did not fill at the curve's opening tax");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

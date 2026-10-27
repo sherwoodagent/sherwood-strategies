@@ -171,15 +171,26 @@ Record the printed `padSetHash` with the grant.
 No new certification is owed. The template was class-certified at tier 0,
 3,500 bps, on 2026-10-27 for `execute()` and `settle()` (see "Class
 certification" in `docs/launchpad/sushi.md`). The certification is keyed to the
-template's codehash and selectors, and the fast-follow changes neither. The
-template binds any granted adapter at clone-init. A Stonk launch prices at
-tier 0 like a Sushi one: coverage and the proposer bond are sized on 35% of
-`assetIn`.
+clone codehash, anchored to the template's, and the selector; the fast-follow
+changes neither. The template binds any granted adapter at clone-init. A Stonk
+launch prices at tier 0 like a Sushi one: coverage and the proposer bond are
+sized on 35% of `assetIn`.
+
+That bound was argued for Sushi on a fee-sized honest-case loss. On Stonk the
+honest-case loss is the opening tax: F-4 makes the dev buy fill at
+`startTaxBps` (elapsed time is zero), and the pad accepts `startTaxBps` up to
+9,900. A launch with a high opening tax would lose most of its capital to tax
+by design, with only the 16.5% creator share coming back to the vault. The
+launch rule below caps it; the contracts do not.
 
 ## Launch rules for mainnet
 
 - The F-4 rule above: with a dev buy, `bufferSecs == 0` and a non-zero,
   lens-quoted `minTokensOut`. Every capitalised Stonk launch is a dev buy.
+- `startTaxBps` is the dev buy's loss, paid in the launch transaction. Keep it
+  at or below 1,000 bps (the value the Stonk fork suite launches with) until
+  the CLI enforces a ceiling; a 3,500 bps opening tax would eat the
+  whole tier bound before the curve opens.
 - `reserveAmount` is minted to the fund for free before `arm`; `minTokensOut`
   floors only the dev buy. So the Sushi rule `minTokensOut >= reserveAmount`
   (F-7) does not apply here, and nothing reverts if they differ.
@@ -212,7 +223,8 @@ The adapter is readiness-reviewed, not audited.
 ## Follow-ups
 
 - The CLI encoder must refuse a dev buy with `bufferSecs != 0` or
-  `minTokensOut == 0`, so the proposal never reaches a vote.
+  `minTokensOut == 0`, and cap `startTaxBps` (1,000 bps is the working ceiling),
+  so the proposal never reaches a vote.
 - Consumer sync once the adapter is deployed: CLI, SDK, app, skill, docs and
   address pointers need `STONK_LAUNCH_ADAPTER`.
 - `deployments/README.md` and `docs/launchpad/design.md` say no Stonk adapter

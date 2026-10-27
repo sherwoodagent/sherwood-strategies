@@ -446,3 +446,24 @@ Nothing here is an audit claim; the template and adapters are readiness-reviewed
   disarm closed is now bounded by the floor off the adapter's quote, the thin-pool refusal and the 3,500 bps
   `assetIn` cap, which is the class bound. Nothing here is an audit claim; the template remains readiness-reviewed.
 
+
+## Addendum, 2026-10-27: Stonk fast-follow
+
+- F-4 is applied. `StonkLaunchAdapter.executeLaunch` reverts `DevBuyWithoutFloor` when `quoteIn != 0` and
+  `minTokensOut == 0`, and `DevBuyInsideBuffer` when `quoteIn != 0` and `bufferSecs != 0`, both before
+  `createLaunch`. Pinned by `test_RevertWhen_DevBuyHasNoFloor_NoFundsMove`,
+  `test_RevertWhen_DevBuyInsideTheOpeningBuffer_NoFundsMove` and the fork test
+  `test_fork_adapterDevBuy_refusedInsideTheBufferAndFilledAtTheOpeningTax`, which shows the live WETH pad accepts
+  `bufferSecs == 0` and fills the dev buy at the opening tax (`currentTaxBps == 1000 == startTaxBps`).
+- Decision 1 is revisited: Stonk joins 4663 through `--sig 'runStonk()'` (adapter, eight V2 pads, lens; template
+  untouched). Tier-2 item 11 is satisfied once that broadcast lands. Not deployed at writing.
+- G-6 (Stonk `abort` unreachable, Info, SHE-365) is back in scope and accepted as design: the strategy never
+  calls `abort`.
+- The Stonk Slither items are back in scope. `slither src/launchpad/adapters/StonkLaunchAdapter.sol --config-file
+  slither.config.json` (0.11.3) reports 13 results over 7 detectors: `locked-ether` 1, `uninitialized-local` 1,
+  `unused-return` 2, `events-maths` 1, `missing-zero-check` 4, `calls-loop` 2, `timestamp` 2. The same run at
+  `1abec71`, before F-4, gives the same 13. F-3 triaged the first three by name; the other four are Low and
+  unchanged. No reentrancy detector fires, so the inline `reentrancy-no-eth` disable is still live.
+- The Stonk fork suite is now 11 tests (10 in section 6). Stonk unit tests: 65; deploy rehearsal: 31.
+
+Nothing here is an audit claim; the adapter is readiness-reviewed. Venue doc: `docs/launchpad/stonk.md`.

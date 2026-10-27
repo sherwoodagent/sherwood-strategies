@@ -115,7 +115,9 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///                             (`deadline = armTime + bufferSecs +
     ///                             windowSecs`). It is not a post-window grace
     ///                             period; verified on 4663 by
-    ///                             `StonkLaunchRobinhoodFork.t.sol`.
+    ///                             `StonkLaunchRobinhoodFork.t.sol`. A
+    ///                             launch that carries a dev buy must set it
+    ///                             to zero (readiness F-4).
     /// @param unsoldMode           Unsold-supply disposition at graduation.
     /// @param openEnded            No closing deadline (see `clonePhase`).
     /// @param postTaxBps           Tax after the decay schedule ends.
@@ -369,6 +371,13 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///         params contradict each other, and silently ignoring one half is
     ///         how a fund ends up with a reserve nobody checked.
     error MinOutWithoutBuy(uint256 minTokensOut);
+    /// @notice `p.quoteIn != 0` but `p.minTokensOut == 0`: a dev buy with no
+    ///         `minTokensOut` floor would accept any fill. Readiness F-4 (G-3).
+    error DevBuyWithoutFloor(uint256 quoteIn);
+    /// @notice `p.quoteIn != 0` with `bufferSecs != 0`. `arm` and `buy` run in
+    ///         one transaction, so elapsed time is zero, and with a buffer the
+    ///         dev buy pays the 99.99% opening tax. Readiness F-4 (G-3).
+    error DevBuyInsideBuffer(uint32 bufferSecs);
     /// @notice `block.timestamp > p.deadline`. This venue's `createLaunch`
     ///         takes no deadline of its own, so the adapter enforces the
     ///         caller's locally rather than dropping it — a proposal executed
@@ -723,8 +732,10 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         if (launchToken != address(0)) revert AlreadyLaunched(launchToken);
         if (p.deadline != 0 && block.timestamp > p.deadline) revert DeadlineExpired(p.deadline, block.timestamp);
         if (p.quoteIn == 0 && p.minTokensOut != 0) revert MinOutWithoutBuy(p.minTokensOut);
+        if (p.quoteIn != 0 && p.minTokensOut == 0) revert DevBuyWithoutFloor(p.quoteIn);
 
         VenueData memory v = abi.decode(p.venueData, (VenueData));
+        if (p.quoteIn != 0 && v.bufferSecs != 0) revert DevBuyInsideBuffer(v.bufferSecs);
         if (p.reserveAmount >= v.supply) revert ReserveExceedsSupply(p.reserveAmount, v.supply);
 
         IStonkSafeLaunchpadV2 padContract = IStonkSafeLaunchpadV2(pad);

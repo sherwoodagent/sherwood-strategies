@@ -11,9 +11,9 @@ The format matches the protocol's `chains/<chainid>.json`: flat `KEY: address` p
 | `SUSHI_LAUNCH_ADAPTER` | `SushiLaunchAdapter` implementation | same |
 | `LIGHTER_PERP_TEMPLATE` | `LighterPerpStrategy` template | `script/lighter/DeployLighterTemplate.s.sol` |
 
-`_meta.launchpad` records the block, deployer, the protocol singletons used, the Stonk `padSetHash`, the Sushi launchpad's ERC-1967 implementation at deploy, and whether the owner steps (grants, template approval) landed in the same run. `_meta.lighter` records the same minus the venue fields.
+`_meta.launchpad` records the block, deployer, the protocol singletons used, the Stonk `padSetHash`, the Sushi launchpad's ERC-1967 implementation at deploy, and whether the owner steps (grants, template approval) landed in the same run. `_meta.lighter` records the same minus the venue fields. A Stonk fast-follow (`--sig 'runStonk()'`) records its hash under `_meta.stonkFastFollow.padSetHash` instead, with `block`, `deployer`, `tierRegistry`, `lens` and `granted`, and leaves `_meta.launchpad` alone.
 
-`STONK_LAUNCH_ADAPTER` may be absent on a chain. A Sushi-only ceremony (`--sig 'runSushi()'`) records only `LAUNCHPAD_TEMPLATE` and `SUSHI_LAUNCH_ADAPTER`, and its `_meta.launchpad` has no `stonkPadSetHash`. Verify such a chain with `--sig 'verifySushi()'`; `verify()` requires every Stonk counterparty, so it fails there by design.
+`STONK_LAUNCH_ADAPTER` may be absent on a chain. A Sushi-only ceremony (`--sig 'runSushi()'`) records only `LAUNCHPAD_TEMPLATE` and `SUSHI_LAUNCH_ADAPTER`, and its `_meta.launchpad` has no `stonkPadSetHash`. Verify such a chain with `--sig 'verifySushi()'`; `verify()` requires every Stonk counterparty, so it fails there by design. Stonk arrives on such a chain through the fast-follow `--sig 'runStonk()'`, which records `STONK_LAUNCH_ADAPTER`; from then on `verify()` is the chain's check.
 
 On 4663 the launchpad script reads the protocol singletons from the env first, then `lib/sherwood-protocol/chains/4663.json`, then `script/launchpad/addresses-4663.json`, which carries them with provenance (F-9 in `docs/launchpad/audit-2026-10-19-mainnet-readiness.md`):
 

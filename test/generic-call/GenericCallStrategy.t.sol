@@ -962,6 +962,45 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
         assertEq(uint256(c.state()), uint256(BaseStrategy.State.Executed));
     }
 
+    /// @notice A patch can reach a word inside a dynamic argument when the encoder counts the ABI
+    ///         layout: `swapRoute((tokenIn, tokenOut, amountIn, minOut, hint))` puts the tuple's offset
+    ///         at word 0, so `amountIn` is word 3 and `minOut` word 4.
+    function test_settle_patchInsideADynamicArgument() public {
+        ERC20Mock stock = new ERC20Mock("STOCK", "STK", 18);
+        MockRateSwap swap = new MockRateSwap();
+        swap.setRate(address(usdg), address(stock), 0.0137e30);
+        swap.setRate(address(stock), address(usdg), 73e6);
+        BatchExecutorLib.Call[] memory e = _two(
+            _call(address(usdg), abi.encodeCall(IERC20.approve, (address(swap), PULL))),
+            _call(address(swap), abi.encodeCall(MockRateSwap.swap, (address(usdg), address(stock), PULL)))
+        );
+        MockRateSwap.Route memory r = MockRateSwap.Route({
+            tokenIn: address(stock), tokenOut: address(usdg), amountIn: 0, minOut: 0, hint: hex"beef"
+        });
+        bytes memory sell = abi.encodeCall(MockRateSwap.swapRoute, (r));
+        uint256 word0;
+        assembly ("memory-safe") {
+            word0 := mload(add(sell, 36))
+        }
+        assertEq(word0, 0x20, "word 0 is the tuple offset");
+        BatchExecutorLib.Call[] memory s = _two(
+            _call(address(stock), abi.encodeCall(IERC20.approve, (address(swap), type(uint256).max))),
+            _call(address(swap), sell)
+        );
+        GenericCallStrategy.BalancePatch[] memory p = new GenericCallStrategy.BalancePatch[](2);
+        p[0] = _scaled(1, 3, address(stock), 0, 0);
+        p[1] = _scaled(1, 4, address(stock), 72.27e6, 1e18);
+        GenericCallStrategy c = _initP(PULL, e, s, p, _noSweep());
+        _execute(c, PULL);
+
+        r.amountIn = 13.7e18;
+        r.minOut = 990.099e6;
+        vm.expectCall(address(swap), abi.encodeCall(MockRateSwap.swapRoute, (r)));
+        _settle(c);
+        assertEq(stock.balanceOf(address(c)), 0, "position fully sold");
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS - PULL + 1_000.1e6);
+    }
+
     /// @notice An unpatched settle call runs with the calldata fixed at init.
     function test_settle_unpatchedCallUsesInitAmount() public {
         ERC20Mock stock = new ERC20Mock("STOCK", "STK", 18);

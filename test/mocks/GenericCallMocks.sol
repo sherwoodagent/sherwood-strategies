@@ -258,6 +258,20 @@ contract MockRateSwap {
         ERC20Mock(tokenOut).mint(msg.sender, out);
     }
 
+    /// @notice A router-style argument: one dynamic tuple, so the amounts sit behind an offset word.
+    struct Route {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 minOut;
+        bytes hint;
+    }
+
+    function swapRoute(Route calldata r) external returns (uint256 out) {
+        out = swap(r.tokenIn, r.tokenOut, r.amountIn);
+        if (out < r.minOut) revert TooLittleReceived(out, r.minOut);
+    }
+
     /// @notice `swap` with a router-style minimum out.
     function swapMin(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut)
         external

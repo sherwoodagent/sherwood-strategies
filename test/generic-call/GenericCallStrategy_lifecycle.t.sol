@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {SyndicateGovernor} from "@sherwood/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "@sherwood/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "@sherwood/SyndicateVault.sol";
@@ -223,13 +224,19 @@ contract GenericCallStrategyLifecycleTest is Test {
 
     /// @dev The batch shape the Arena runner and the CLI emit, with caps [0, PULL] and [0].
     function _propose(GenericCallStrategy c) internal returns (uint256 pid) {
+        pid = _proposeWith(c, PULL, PULL);
+    }
+
+    /// @dev The same shape with the approve amount and the cap on `clone.execute()` chosen apart
+    ///      from `pullAmount`: nothing on chain ties the three together.
+    function _proposeWith(GenericCallStrategy c, uint256 approveAmount, uint256 cap) internal returns (uint256 pid) {
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
-        execCalls[0] = _call(address(usdg), abi.encodeCall(IERC20.approve, (address(c), PULL)));
+        execCalls[0] = _call(address(usdg), abi.encodeCall(IERC20.approve, (address(c), approveAmount)));
         execCalls[1] = _call(address(c), abi.encodeCall(BaseStrategy.execute, ()));
         BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
         settleCalls[0] = _call(address(c), abi.encodeCall(BaseStrategy.settle, ()));
         uint256[] memory execCaps = new uint256[](2);
-        execCaps[1] = PULL;
+        execCaps[1] = cap;
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(agent);
         pid = governor.propose(
@@ -290,6 +297,60 @@ contract GenericCallStrategyLifecycleTest is Test {
         assertGt(vaultAfter, vaultBefore, "yield reached the vault");
         assertLe(vaultAfter, vaultBefore + YIELD, "no more than the yield");
         assertFalse(vault.redemptionsLocked());
+    }
+
+    /// @notice Design D3: the cap on `clone.execute()` meters the vault's net outflow, so a plan with
+    ///         approve == pull > cap that sends the excess back inside the execute leg passes the
+    ///         meter, while the clone commands the whole pull for the transaction. The vault's net
+    ///         loss stays bounded by the cap; guardians must still require pull <= cap (D10.2).
+    function test_lifecycle_pullAboveCapPassesTheMeterWhenReturnedInsideTheLeg() public {
+        uint256 cap = PULL / 10;
+        uint256 excess = PULL - cap;
+        BatchExecutorLib.Call[] memory e = new BatchExecutorLib.Call[](4);
+        e[0] = _call(address(usdg), abi.encodeCall(IERC20.approve, (address(venue), PULL)));
+        e[1] = _call(address(venue), abi.encodeCall(MockCallVenue.deposit, (address(usdg), PULL)));
+        e[2] = _call(address(venue), abi.encodeCall(MockCallVenue.withdraw, (address(usdg), excess)));
+        e[3] = _call(address(usdg), abi.encodeCall(IERC20.transfer, (address(vault), excess)));
+        BatchExecutorLib.Call[] memory s = new BatchExecutorLib.Call[](1);
+        s[0] = _call(address(venue), abi.encodeCall(MockCallVenue.withdraw, (address(usdg), cap)));
+        GenericCallStrategy c = _clone(e, s);
+        assertEq(c.pullAmount(), PULL);
+        uint256 pid = _proposeWith(c, PULL, cap);
+        _approve(pid);
+
+        uint256 vaultBefore = usdg.balanceOf(address(vault));
+        // The clone pulls the whole PULL and hands all of it to the venue before returning the excess.
+        vm.expectCall(address(usdg), abi.encodeCall(IERC20.transferFrom, (address(vault), address(c), PULL)));
+        vm.expectCall(address(usdg), abi.encodeCall(IERC20.transferFrom, (address(c), address(venue), PULL)));
+        governor.executeProposal(pid);
+        assertEq(vaultBefore - usdg.balanceOf(address(vault)), cap, "net outflow is the cap, not the pull");
+        assertEq(venue.deposited(address(usdg), address(c)), cap);
+
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
+        governor.settleProposal(pid);
+        assertEq(usdg.balanceOf(address(vault)), vaultBefore, "everything home");
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice An approve below `pullAmount` fails the pull itself: `executeProposal` reverts with the
+    ///         token's allowance error, nothing moves, and the proposal expires with its window.
+    function test_lifecycle_approveBelowPullRevertsAndTheProposalExpires() public {
+        BatchExecutorLib.Call[] memory s = new BatchExecutorLib.Call[](1);
+        s[0] = _call(address(venue), abi.encodeCall(MockCallVenue.withdraw, (address(usdg), PULL)));
+        GenericCallStrategy c = _clone(_depositLeg(), s);
+        uint256 pid = _proposeWith(c, PULL - 1, PULL);
+        _approve(pid);
+
+        uint256 vaultBefore = usdg.balanceOf(address(vault));
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(c), PULL - 1, PULL)
+        );
+        governor.executeProposal(pid);
+        assertEq(usdg.balanceOf(address(vault)), vaultBefore, "nothing left the vault");
+        assertEq(uint256(c.state()), uint256(BaseStrategy.State.Pending));
+
+        vm.warp(vm.getBlockTimestamp() + EXECUTION_WINDOW + 1);
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Expired));
     }
 
     /// @notice A failing inner call reverts `executeProposal` with the leg, index and venue error.

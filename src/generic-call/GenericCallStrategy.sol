@@ -177,6 +177,7 @@ contract GenericCallStrategy is BaseStrategy {
         address[DENIED] memory denied
     ) private {
         if (calls.length > MAX_CALLS_PER_LEG) revert TooManyCalls(leg);
+        // slither-disable-next-line uninitialized-local (a zero-initialised accumulator by design)
         uint256 size;
         for (uint256 i; i < calls.length; ++i) {
             BatchExecutorLib.Call memory c = calls[i];
@@ -326,6 +327,7 @@ contract GenericCallStrategy is BaseStrategy {
             BatchExecutorLib.Call storage c = calls[i];
             bytes memory data = c.data;
             if (leg == LEG_SETTLE) _applyPatch(i, data);
+            // slither-disable-next-line calls-loop (at most MAX_CALLS_PER_LEG calls; forwarding them is the template)
             (bool ok, bytes memory ret) = c.target.call(data);
             if (!ok) revert CallFailed(leg, i, ret);
         }
@@ -339,6 +341,7 @@ contract GenericCallStrategy is BaseStrategy {
         for (uint256 k; k < n; ++k) {
             BalancePatch storage p = _settlePatches[k];
             if (p.callIndex != callIndex) continue;
+            // slither-disable-next-line calls-loop (at most MAX_SETTLE_PATCHES reads, each of a token in the plan)
             uint256 word = IERC20(p.token).balanceOf(address(this));
             if (p.mulDen != 0) word = Math.mulDiv(word, p.mulNum, p.mulDen);
             uint256 offset = 4 + 32 * p.wordIndex;

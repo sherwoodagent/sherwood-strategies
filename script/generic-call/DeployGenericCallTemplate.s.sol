@@ -54,8 +54,9 @@ import {GenericCallStrategy} from "../../src/generic-call/GenericCallStrategy.so
  *   ADDRESSES. `STRATEGY_FACTORY` and `TIER_REGISTRY` come from the env if set,
  *   else from the pinned protocol's address book
  *   (`lib/sherwood-protocol/chains/{chainId}.json`). On 4663 the book at the
- *   current pin names neither, so export both (`deployments/README.md` lists
- *   the live values); the script refuses to run otherwise. The deployed
+ *   current pin (`a91fae2f`) names both; an exported value still wins
+ *   (`deployments/README.md` lists the live values), and the script refuses
+ *   to run when neither resolves. The deployed
  *   template is recorded as `GENERIC_CALL_TEMPLATE` in THIS repo's book,
  *   `deployments/<chainid>.json`, on a real broadcast only (see
  *   `DeploymentsBook`); this repo never edits the protocol's book.

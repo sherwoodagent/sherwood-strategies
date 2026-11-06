@@ -66,8 +66,8 @@ contract DeployGenericCallTemplateForkTest is Test {
 
     /// @dev Protocol v1 singletons on 4663, as `deployments/README.md` and the
     ///      `_meta` sections of `deployments/4663.json` record them. The pinned
-    ///      protocol book for 4663 names neither, which is why the script takes
-    ///      them from the env there.
+    ///      protocol book for 4663 names both since `a91fae2f`; the constants
+    ///      keep this suite independent of the book.
     address constant STRATEGY_FACTORY = 0xb06788F027268a9A06c3AD41a88559530D2E54b1;
     address constant TIER_REGISTRY = 0x4614f058920941A0a9a852e62485fbDE692D75E1;
     /// @dev `StrategyFactory.syndicateFactory()` on 4663, read 2026-10-19

@@ -34,7 +34,8 @@ docs/<strategy>/           design notes
 forge-std resolve through the protocol's own vendored copies, so both repos compile
 the shared sources against the same dependency versions.
 
-Current pin: `v1-deploy` at `2a885c53`, the tree being deployed for protocol v1.
+Current pin: `v1-deploy` at `a91fae2f`, the tree 4663 runs for protocol v1 (the live vault implementation's
+verified source matches it; `docs/generic-call/audit-2026-11-06-generic-call-readiness.md` section 1).
 Re-pin when v1 lands on `main`:
 
 ```bash

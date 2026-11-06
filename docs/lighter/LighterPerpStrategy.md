@@ -16,7 +16,7 @@ This document serves two audiences:
 Source: `src/lighter/LighterPerpStrategy.sol`, extending the protocol's
 `BaseStrategy` (`lib/sherwood-protocol/src/strategies/BaseStrategy.sol`, imported as
 `@sherwood/strategies/BaseStrategy.sol`) and using `src/lighter/IZkLighter.sol`. The
-protocol is pinned to **v1-deploy `2a885c53`**. File references are relative to this
+protocol is pinned to **v1-deploy `a91fae2f`**. File references are relative to this
 repo's root and pinned to the code this document ships with — the code is
 authoritative where any external description disagrees. Protocol-wide docs:
 https://docs.sherwood.sh/

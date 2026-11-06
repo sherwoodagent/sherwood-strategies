@@ -1,6 +1,6 @@
 # GenericCallStrategy design
 
-Design notes and normative requirements for `src/generic-call/`, on Sherwood protocol v1 (`v1-deploy` `2a885c53`, pinned in `lib/sherwood-protocol`). This document started as the openspec change `generic-call-strategy` in sherwood-protocol PR #414 (SHE-510; proposal, design and spec, merged as `d5452dc6` on the `post-audit-v2` tree). The decisions carry over as they were. Where the v1-deploy pin or this repo differs, the text says so. The integration guide is [`GenericCallStrategy.md`](GenericCallStrategy.md).
+Design notes and normative requirements for `src/generic-call/`, on Sherwood protocol v1 (`v1-deploy` `a91fae2f`, pinned in `lib/sherwood-protocol`, the tree 4663 runs). This document started as the openspec change `generic-call-strategy` in sherwood-protocol PR #414 (SHE-510; proposal, design and spec, merged as `d5452dc6` on the `post-audit-v2` tree). The decisions carry over as they were. Where the v1-deploy pin or this repo differs, the text says so. The integration guide is [`GenericCallStrategy.md`](GenericCallStrategy.md).
 
 ## Why
 
@@ -188,7 +188,7 @@ Bound: the written amount is the clone's own balance, so a patch can never move 
 
 The template requires NO venue address at deploy time: its call lists, pull amount and sweep tokens arrive per clone through `_initialize(bytes)`, and it binds no counterparty, so it needs no `TierRegistry` seeding. It reaches the allowlist only through the `StrategyFactory` owner's `setTemplateApproval(template, true)`.
 
-`script/generic-call/DeployGenericCallTemplate.s.sol` does both in one broadcast: plain `new GenericCallStrategy()`, then the approval if the broadcaster owns `StrategyFactory`, else `RUNBOOK` lines and `ownerStepsComplete == false`. On a real broadcast it records `GENERIC_CALL_TEMPLATE` and `_meta.genericCall` in `deployments/<chainid>.json`; `--sig 'verify()'` re-checks the entry. On 4663 it is an owner GO item, and `STRATEGY_FACTORY` and `TIER_REGISTRY` must be exported because the pinned protocol book names neither. Steps and commands: [`GenericCallStrategy.md`](GenericCallStrategy.md#deployment).
+`script/generic-call/DeployGenericCallTemplate.s.sol` does both in one broadcast: plain `new GenericCallStrategy()`, then the approval if the broadcaster owns `StrategyFactory`, else `RUNBOOK` lines and `ownerStepsComplete == false`. On a real broadcast it records `GENERIC_CALL_TEMPLATE` and `_meta.genericCall` in `deployments/<chainid>.json`; `--sig 'verify()'` re-checks the entry. On 4663 it is an owner GO item. `STRATEGY_FACTORY` and `TIER_REGISTRY` come from the env, else from the pinned protocol book, which names both since the `a91fae2f` pin. Steps and commands: [`GenericCallStrategy.md`](GenericCallStrategy.md#deployment).
 
 **Changed from PR #414.** The protocol PR minted the template through the protocol's `DeployAll` ceremony and, for 4663, a standalone `DeployGenericCallTemplate` script, both through the protocol's Create3Factory under a `GENERIC_CALL_TEMPLATE` salt, and booked the address in the protocol's `chains/4663.json`. None of that moved. The deploy here is plain CREATE, so the address that PR predicted is void, and the book is this repo's.
 

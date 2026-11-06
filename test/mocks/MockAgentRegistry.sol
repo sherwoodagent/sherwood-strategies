@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-// Copied from sherwood-protocol test/mocks/MockAgentRegistry.sol at 2a885c53 (v1-deploy, this repo's
+// Copied from sherwood-protocol test/mocks/MockAgentRegistry.sol at a91fae2f (v1-deploy, this repo's
 // submodule pin) so this repo never imports the protocol's test tree. Only the
 // import paths changed. Used by test/generic-call/GenericCallStrategy_lifecycle.t.sol.
 

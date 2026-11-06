@@ -2,7 +2,7 @@
 
 `src/generic-call/GenericCallStrategy.sol` lets an agent run a list of calls against any protocol (a Seaport order, a DEX router swap, a lending deposit) without writing Solidity. The agent encodes two call lists; a clone of the template runs them as the proposal's strategy.
 
-Source: `src/generic-call/GenericCallStrategy.sol`, extending the protocol's `BaseStrategy` (`lib/sherwood-protocol/src/strategies/BaseStrategy.sol`, imported as `@sherwood/strategies/BaseStrategy.sol`) and reusing its `BatchExecutorLib.Call` struct. The protocol is pinned to **v1-deploy `2a885c53`**. File references are relative to this repo's root. Protocol-wide docs: https://docs.sherwood.sh/
+Source: `src/generic-call/GenericCallStrategy.sol`, extending the protocol's `BaseStrategy` (`lib/sherwood-protocol/src/strategies/BaseStrategy.sol`, imported as `@sherwood/strategies/BaseStrategy.sol`) and reusing its `BatchExecutorLib.Call` struct. The protocol is pinned to **v1-deploy `a91fae2f`**, the tree 4663 runs. File references are relative to this repo's root. Protocol-wide docs: https://docs.sherwood.sh/
 
 > **Ported from sherwood-protocol PR #414** (merge `d5452dc6`, written against the `post-audit-v2` tree). The template, its unit suite and its lifecycle suite moved unchanged apart from import paths: `BaseStrategy` and `BatchExecutorLib` are byte-identical between that tree and the pin, and every getter the denylist reads exists at the pin. What changed is around it: the deploy is this repo's script with plain CREATE instead of the protocol's CREATE3 ceremony, the address lives in this repo's `deployments/<chainid>.json`, and `SyndicateVault.rescueERC20` on v1-deploy accepts any recipient (see "Writing legs that work").
 
@@ -152,7 +152,7 @@ Before you vote:
 4. **Book.** On a real broadcast only, the script writes `GENERIC_CALL_TEMPLATE` and `_meta.genericCall` into `deployments/<chainid>.json`. Commit that file with the `broadcast/` log, as `deployments/README.md` describes. Nothing is pre-booked: the key appears only once a broadcast has put code at it.
 5. **Verify.** `--sig 'verify()'` re-reads `GENERIC_CALL_TEMPLATE` and checks it against the chain: code, the template rather than a clone, `name()`, the registry/factory wiring, the approval as a fact, and the uncertified pricing. Verify the source on Sourcify, as for the other templates in the book.
 
-`STRATEGY_FACTORY` and `TIER_REGISTRY` come from the env, else from the pinned protocol book. On 4663 the pinned `chains/4663.json` names neither, so export both (values in `deployments/README.md`):
+`STRATEGY_FACTORY` and `TIER_REGISTRY` come from the env, else from the pinned protocol book. Since the `a91fae2f` pin, `chains/4663.json` names both; an exported value still wins over the book (values in `deployments/README.md`):
 
 ```bash
 STRATEGY_FACTORY=0xb06788F027268a9A06c3AD41a88559530D2E54b1 \

@@ -86,7 +86,7 @@ contract GenericCallStrategy is BaseStrategy {
 
     /// @notice A best-effort revoke that the token refused; nothing else depends on it.
     event RevokeFailed(address indexed token, address indexed spender);
-    /// @notice A sweep token whose transfer failed; it stays on the clone for `rescueTo`.
+    /// @notice A sweep token whose balance read or transfer failed; it stays on the clone for `rescueTo`.
     event SweepFailed(address indexed token);
 
     /// @notice The vault asset, read at initialize.
@@ -305,8 +305,8 @@ contract GenericCallStrategy is BaseStrategy {
         _pushAllToVault(asset);
         for (uint256 i; i < _sweepTokens.length; ++i) {
             address t = _sweepTokens[i];
-            uint256 bal = _readWord(t, abi.encodeCall(IERC20.balanceOf, (address(this))));
-            if (bal != 0 && !IERC20(t).trySafeTransfer(vault(), bal)) emit SweepFailed(t);
+            (bool ok, uint256 bal) = _readWord(t, abi.encodeCall(IERC20.balanceOf, (address(this))));
+            if (!ok || (bal != 0 && !IERC20(t).trySafeTransfer(vault(), bal))) emit SweepFailed(t);
         }
     }
 
@@ -349,29 +349,40 @@ contract GenericCallStrategy is BaseStrategy {
     }
 
     /// @dev Best-effort: a grant whose read does not answer one word is skipped, a failed revoke is
-    ///      ignored. Hygiene only; the bound is that the clone holds only what it pulled.
+    ///      ignored. Hygiene only; the bound is that the clone holds only what it pulled. The revoke
+    ///      copies no returndata, so a token cannot charge the clone for a large return buffer.
     function _revokeGrants() private {
         for (uint256 i; i < _grants.length; ++i) {
             Grant memory g = _grants[i];
             bytes memory read = g.forAll
                 ? abi.encodeCall(IERC721.isApprovedForAll, (address(this), g.spender))
                 : abi.encodeCall(IERC20.allowance, (address(this), g.spender));
-            if (_readWord(g.token, read) == 0) continue;
+            (bool readOk, uint256 open) = _readWord(g.token, read);
+            if (!readOk || open == 0) continue;
             bytes memory revoke = g.forAll
                 ? abi.encodeCall(IERC721.setApprovalForAll, (g.spender, false))
                 : abi.encodeCall(IERC20.approve, (g.spender, 0));
-            (bool ok,) = g.token.call{gas: HYGIENE_GAS}(revoke);
+            address token = g.token;
+            bool ok;
+            assembly ("memory-safe") {
+                ok := call(HYGIENE_GAS, token, 0, add(revoke, 0x20), mload(revoke), 0, 0)
+            }
             if (!ok) emit RevokeFailed(g.token, g.spender);
         }
     }
 
-    /// @dev One-word read under `HYGIENE_GAS`; a codeless target, revert or wrong-length return reads as zero.
-    function _readWord(address target, bytes memory data) private view returns (uint256 word) {
-        if (target.code.length == 0) return 0;
-        (bool ok, bytes memory ret) = target.staticcall{gas: HYGIENE_GAS}(data);
-        if (!ok || ret.length != 32) return 0;
+    /// @dev One-word read under `HYGIENE_GAS`. `ok` is false for a codeless target, a revert or a
+    ///      return that is not exactly one word. Only the first word is ever copied, so a callee
+    ///      returning a large buffer costs the clone nothing beyond the capped call.
+    function _readWord(address target, bytes memory data) private view returns (bool ok, uint256 word) {
+        if (target.code.length == 0) return (false, 0);
         assembly ("memory-safe") {
-            word := mload(add(ret, 0x20))
+            ok := staticcall(HYGIENE_GAS, target, add(data, 0x20), mload(data), 0, 0)
+            ok := and(ok, eq(returndatasize(), 0x20))
+            if ok {
+                returndatacopy(0, 0, 0x20)
+                word := mload(0)
+            }
         }
     }
 

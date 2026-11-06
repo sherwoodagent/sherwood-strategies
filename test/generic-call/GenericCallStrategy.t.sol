@@ -707,7 +707,8 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
         assertEq(uint256(c.state()), uint256(BaseStrategy.State.Settled));
     }
 
-    /// @notice A sweep token that lost its code, or whose `balanceOf` reverts, reads as zero and is skipped.
+    /// @notice A sweep token that lost its code, or whose `balanceOf` reverts, is skipped with
+    ///         `SweepFailed`, so an unread balance left on the clone is visible.
     function test_settle_unreadableSweepTokenIsSkipped() public {
         ERC20Mock gone = new ERC20Mock("GONE", "GONE", 18);
         ERC20Mock broken = new ERC20Mock("BROKEN", "BRK", 18);
@@ -716,11 +717,33 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
         sweep[1] = address(broken);
         GenericCallStrategy c = _init(PULL, _none(), _none(), sweep);
         _execute(c, PULL);
+        broken.mint(address(c), 5e18);
         vm.etch(address(gone), "");
         vm.mockCallRevert(address(broken), abi.encodeWithSelector(IERC20.balanceOf.selector), "broken");
+        vm.expectEmit(address(c));
+        emit GenericCallStrategy.SweepFailed(address(gone));
+        vm.expectEmit(address(c));
+        emit GenericCallStrategy.SweepFailed(address(broken));
         _settle(c);
         assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS, "asset home");
         assertEq(uint256(c.state()), uint256(BaseStrategy.State.Settled));
+        vm.clearMockedCalls();
+        assertEq(broken.balanceOf(address(c)), 5e18, "left on the clone for rescueTo");
+    }
+
+    /// @notice A sweep token whose `balanceOf` answers more than one word is unreadable, not misread.
+    function test_settle_wrongLengthSweepReadIsSkipped() public {
+        ERC20Mock wide = new ERC20Mock("WIDE", "WIDE", 18);
+        address[] memory sweep = new address[](1);
+        sweep[0] = address(wide);
+        GenericCallStrategy c = _init(PULL, _none(), _none(), sweep);
+        _execute(c, PULL);
+        wide.mint(address(c), 5e18);
+        vm.mockCall(address(wide), abi.encodeWithSelector(IERC20.balanceOf.selector), abi.encode(5e18, 1));
+        vm.expectEmit(address(c));
+        emit GenericCallStrategy.SweepFailed(address(wide));
+        _settle(c);
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS, "asset home");
     }
 
     /// @notice A token that burns gas on the revoke read or write gets `HYGIENE_GAS` each: settle completes

@@ -10,8 +10,11 @@ The format matches the protocol's `chains/<chainid>.json`: flat `KEY: address` p
 | `STONK_LAUNCH_ADAPTER` | `StonkLaunchAdapter` implementation | same |
 | `SUSHI_LAUNCH_ADAPTER` | `SushiLaunchAdapter` implementation | same |
 | `LIGHTER_PERP_TEMPLATE` | `LighterPerpStrategy` template | `script/lighter/DeployLighterTemplate.s.sol` |
+| `GENERIC_CALL_TEMPLATE` | `GenericCallStrategy` template | `script/generic-call/DeployGenericCallTemplate.s.sol` |
 
-`_meta.launchpad` records the block, deployer, the protocol singletons used, the Stonk `padSetHash`, the Sushi launchpad's ERC-1967 implementation at deploy, and whether the owner steps (grants, template approval) landed in the same run. `_meta.lighter` records the same minus the venue fields.
+`_meta.launchpad` records the block, deployer, the protocol singletons used, the Stonk `padSetHash`, the Sushi launchpad's ERC-1967 implementation at deploy, and whether the owner steps (grants, template approval) landed in the same run. `_meta.lighter` records the same minus the venue fields. `_meta.genericCall` records the block, deployer, `strategyFactory`, `tierRegistry` and whether the template approval landed in the same run.
+
+`GENERIC_CALL_TEMPLATE` is the address guardians compare `StrategyFactory.cloneTemplate(clone)` against. It lives only here, never in the protocol's `chains/<chainid>.json`, and appears only once a broadcast has deployed it. The generic-call and Lighter scripts read `STRATEGY_FACTORY` and `TIER_REGISTRY` from the env, then the pinned protocol book; on 4663 that book names neither, so export both (values below) for `run()` and `verify()` alike.
 
 `STONK_LAUNCH_ADAPTER` may be absent on a chain. A Sushi-only ceremony (`--sig 'runSushi()'`) records only `LAUNCHPAD_TEMPLATE` and `SUSHI_LAUNCH_ADAPTER`, and its `_meta.launchpad` has no `stonkPadSetHash`. Verify such a chain with `--sig 'verifySushi()'`; `verify()` requires every Stonk counterparty, so it fails there by design.
 
@@ -29,6 +32,7 @@ Check a recorded deployment against the chain without redeploying:
 forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy --rpc-url <rpc> --sig 'verify()'
 forge script script/launchpad/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy --rpc-url <rpc> --sig 'verifySushi()'
 forge script script/lighter/DeployLighterTemplate.s.sol:DeployLighterTemplate --rpc-url <rpc> --sig 'verify()'
+forge script script/generic-call/DeployGenericCallTemplate.s.sol:DeployGenericCallTemplate --rpc-url <rpc> --sig 'verify()'
 ```
 
 Verification treats owner steps as facts: a deployment still owed Safe transactions fails it until they land.

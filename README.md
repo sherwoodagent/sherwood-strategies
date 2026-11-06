@@ -11,7 +11,8 @@ audit cycle and depend on third-party contracts (launchpads, perp venues). Each 
 is an ordinary `BaseStrategy` template. Nothing here changes protocol behaviour: a
 template reaches a vault only after the Sherwood owner approves it on
 `StrategyFactory`, and every venue it calls must be on the `TierRegistry`
-counterparty allowlist.
+counterparty allowlist. The one deliberate exception is the generic-call
+template (see "Adding a strategy").
 
 ## Layout
 
@@ -62,6 +63,17 @@ ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-con
 3. Settle all-or-revert: after `settle()` the clone holds nothing. Anything it cannot
    convert goes to the vault as-is. It is never left on the clone.
 4. Ship unit tests against mocks and a fork suite against the live venue.
+
+**Generic-call is the deliberate exception to rule 2.** `GenericCallStrategy`
+(`src/generic-call/`) has no venue allowlist of its own: it is tier 2 forever and
+never certified, each clone runs call lists fixed at its `initialize` and checked
+against a denylist of the protocol contracts around its vault, and the
+`StrategyFactory` owner's template approval is the gate. That is its purpose: an
+agent reaches a venue no shipped template covers by encoding calls instead of
+writing Solidity, while the clone can only ever lose the `pullAmount` it pulls, so
+tier-2 full-notional coverage and the guardian review carry what an allowlist
+would. For the same reason rule 1 holds only for the template's own transfers and
+rule 3 only for its asset leg (`docs/generic-call/design.md`, D2, D3, D6).
 
 ## License
 

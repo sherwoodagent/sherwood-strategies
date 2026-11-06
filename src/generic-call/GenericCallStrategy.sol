@@ -25,7 +25,7 @@ interface IProtocolPath {
  * @title GenericCallStrategy
  * @notice Runs a proposer-supplied execute leg and settle leg of calls, fixed at initialize except
  *         for settle-leg balance patches.
- *         Tier 2 forever, never certified, unaudited: see docs/generic-call-strategy.md.
+ *         Tier 2 forever, never certified, unaudited: see docs/generic-call/GenericCallStrategy.md.
  *
  *   Init:    abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls,
  *                       BalancePatch[] settlePatches, address[] sweepTokens)

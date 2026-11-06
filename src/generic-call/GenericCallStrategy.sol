@@ -7,6 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @notice Getters walked to name the protocol contracts a call may not target. Selectors only.
 interface IProtocolPath {
@@ -45,6 +46,8 @@ contract GenericCallStrategy is BaseStrategy {
     uint256 public constant MAX_CALLS_PER_LEG = 16;
     uint256 public constant MAX_LEG_CALLDATA = 16_384;
     uint256 public constant MAX_SWEEP_TOKENS = 16;
+    /// @dev Two per settle call on average: an amount and its scaled minimum.
+    uint256 public constant MAX_SETTLE_PATCHES = 32;
 
     /// @notice An allowance (`forAll == false`) or operator approval a leg grants, revoked after each leg.
     struct Grant {
@@ -54,16 +57,22 @@ contract GenericCallStrategy is BaseStrategy {
     }
 
     /// @notice At settle, argument word `wordIndex` of settle call `callIndex` becomes the clone's
-    ///         live `token` balance. Byte offset `4 + 32 * wordIndex`; one patch per call.
+    ///         live `token` balance, or `balance * mulNum / mulDen` rounded down when the scale is set.
+    ///         Byte offset `4 + 32 * wordIndex`; one patch per word. `(mulNum, mulDen) == (0, 0)` is
+    ///         the identity. A scale lets a patched sell carry a minimum out proportional to what it
+    ///         sells: `mulNum / mulDen` is then the floor price, in output units per unit of `token`.
     struct BalancePatch {
         uint256 callIndex;
         uint256 wordIndex;
         address token;
+        uint256 mulNum;
+        uint256 mulDen;
     }
 
     error TooManyCalls(uint8 leg);
     error CalldataTooLarge(uint8 leg);
     error TooManySweepTokens();
+    error TooManyPatches();
     error InvalidSweepToken(uint256 index);
     error NativeValueUnsupported(uint8 leg, uint256 index);
     error ForbiddenTarget(uint8 leg, uint256 index, address target);
@@ -94,8 +103,6 @@ contract GenericCallStrategy is BaseStrategy {
     BalancePatch[] internal _settlePatches;
     address[] internal _sweepTokens;
     Grant[] internal _grants;
-    /// @dev Settle call index -> patch index + 1; zero means unpatched.
-    mapping(uint256 callIndex => uint256 slot) internal _patchSlot;
 
     function name() external pure returns (string memory) {
         return "Generic Call";
@@ -145,6 +152,7 @@ contract GenericCallStrategy is BaseStrategy {
         ) = abi.decode(data, (uint256, BatchExecutorLib.Call[], BatchExecutorLib.Call[], BalancePatch[], address[]));
 
         if (sweep.length > MAX_SWEEP_TOKENS) revert TooManySweepTokens();
+        if (patches.length > MAX_SETTLE_PATCHES) revert TooManyPatches();
         address asset_ = IERC4626(vault()).asset();
         address[DENIED] memory denied = _protocolAddresses();
         _storeLeg(LEG_EXECUTE, execCalls, _executeCalls, asset_, denied);
@@ -154,7 +162,7 @@ contract GenericCallStrategy is BaseStrategy {
             _sweepTokens.push(sweep[i]);
         }
         for (uint256 i; i < patches.length; ++i) {
-            _storePatch(i, patches[i], settleCalls_, asset_);
+            _storePatch(i, patches, settleCalls_, asset_);
         }
         asset = asset_;
         pullAmount = pull;
@@ -203,16 +211,24 @@ contract GenericCallStrategy is BaseStrategy {
     }
 
     /// @dev The token must already be in the plan (asset, leg target or sweep token). A balance
-    ///      never lands in the address words of an approve or transfer selector.
-    function _storePatch(uint256 i, BalancePatch memory p, BatchExecutorLib.Call[] memory settleCalls_, address asset_)
-        private
-    {
-        if (p.callIndex >= settleCalls_.length || _patchSlot[p.callIndex] != 0) revert InvalidPatch(i);
+    ///      never lands in the address words of an approve or transfer selector. A scale is both
+    ///      set or both zero, and no word is patched twice.
+    function _storePatch(
+        uint256 i,
+        BalancePatch[] memory patches,
+        BatchExecutorLib.Call[] memory settleCalls_,
+        address asset_
+    ) private {
+        BalancePatch memory p = patches[i];
+        if (p.callIndex >= settleCalls_.length) revert InvalidPatch(i);
         bytes memory data = settleCalls_[p.callIndex].data;
         if (data.length < 36 || p.wordIndex >= (data.length - 4) / 32) revert InvalidPatch(i);
         if (p.token != asset_ && pinnedCodehash[p.token] == 0 && !_isSweepToken(p.token)) revert InvalidPatch(i);
         if (p.wordIndex < _addressWords(bytes4(data))) revert InvalidPatch(i);
-        _patchSlot[p.callIndex] = i + 1;
+        if ((p.mulNum == 0) != (p.mulDen == 0)) revert InvalidPatch(i);
+        for (uint256 k; k < i; ++k) {
+            if (patches[k].callIndex == p.callIndex && patches[k].wordIndex == p.wordIndex) revert InvalidPatch(i);
+        }
         _settlePatches.push(p);
     }
 
@@ -315,15 +331,20 @@ contract GenericCallStrategy is BaseStrategy {
         }
     }
 
-    /// @dev The written amount is the clone's own balance: it can never exceed what the clone holds.
+    /// @dev Writes every patch on settle call `callIndex`. An identity patch writes the clone's own
+    ///      balance, never more than it holds; a scaled one writes `mulDiv(balance, mulNum, mulDen)`,
+    ///      and whatever number it writes, the clone still moves only what it holds.
     function _applyPatch(uint256 callIndex, bytes memory data) private view {
-        uint256 slot = _patchSlot[callIndex];
-        if (slot == 0) return;
-        BalancePatch storage p = _settlePatches[slot - 1];
-        uint256 bal = IERC20(p.token).balanceOf(address(this));
-        uint256 offset = 4 + 32 * p.wordIndex;
-        assembly ("memory-safe") {
-            mstore(add(add(data, 32), offset), bal)
+        uint256 n = _settlePatches.length;
+        for (uint256 k; k < n; ++k) {
+            BalancePatch storage p = _settlePatches[k];
+            if (p.callIndex != callIndex) continue;
+            uint256 word = IERC20(p.token).balanceOf(address(this));
+            if (p.mulDen != 0) word = Math.mulDiv(word, p.mulNum, p.mulDen);
+            uint256 offset = 4 + 32 * p.wordIndex;
+            assembly ("memory-safe") {
+                mstore(add(add(data, 32), offset), word)
+            }
         }
     }
 

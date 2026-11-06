@@ -141,7 +141,17 @@ abstract contract GenericCallFixture is Test {
         returns (GenericCallStrategy.BalancePatch[] memory p)
     {
         p = new GenericCallStrategy.BalancePatch[](1);
-        p[0] = GenericCallStrategy.BalancePatch({callIndex: callIndex, wordIndex: wordIndex, token: token});
+        p[0] = _scaled(callIndex, wordIndex, token, 0, 0);
+    }
+
+    function _scaled(uint256 callIndex, uint256 wordIndex, address token, uint256 mulNum, uint256 mulDen)
+        internal
+        pure
+        returns (GenericCallStrategy.BalancePatch memory)
+    {
+        return GenericCallStrategy.BalancePatch({
+            callIndex: callIndex, wordIndex: wordIndex, token: token, mulNum: mulNum, mulDen: mulDen
+        });
     }
 
     function _expectPatchRevert(BatchExecutorLib.Call[] memory s, GenericCallStrategy.BalancePatch[] memory p)
@@ -421,15 +431,27 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
         _defaultClone();
     }
 
-    /// @notice Patches are part of the plan: stored, readable and in the config hash.
+    /// @notice Patches are part of the plan: stored in order, readable and in the config hash. Two
+    ///         patches on one call may target different words; a scale is stored as given.
     function test_init_storesPatches() public {
-        GenericCallStrategy.BalancePatch[] memory p = _patch(0, 1, address(usdg));
-        GenericCallStrategy c = _initP(PULL, _depositLeg(PULL), _withdrawLeg(PULL), p, _noSweep());
+        MockRateSwap swap = new MockRateSwap();
+        BatchExecutorLib.Call[] memory s =
+            _one(_call(address(swap), abi.encodeCall(MockRateSwap.swapMin, (address(usdg), address(usdg), 0, 0))));
+        GenericCallStrategy.BalancePatch[] memory p = new GenericCallStrategy.BalancePatch[](2);
+        p[0] = _scaled(0, 3, address(usdg), 99, 100);
+        p[1] = _scaled(0, 2, address(usdg), 0, 0);
+        GenericCallStrategy c = _initP(PULL, _none(), s, p, _noSweep());
         GenericCallStrategy.BalancePatch[] memory got = c.settlePatches();
-        assertEq(got.length, 1);
+        assertEq(got.length, 2);
         assertEq(got[0].callIndex, 0);
-        assertEq(got[0].wordIndex, 1);
+        assertEq(got[0].wordIndex, 3);
         assertEq(got[0].token, address(usdg));
+        assertEq(got[0].mulNum, 99);
+        assertEq(got[0].mulDen, 100);
+        assertEq(got[1].wordIndex, 2);
+        assertEq(got[1].mulNum, 0);
+        assertEq(got[1].mulDen, 0);
+        assertEq(keccak256(abi.encode(got)), keccak256(abi.encode(p)), "stored as given, in order");
         assertEq(
             c.configHash(),
             keccak256(abi.encode(c.pullAmount(), c.executeCalls(), c.settleCalls(), c.settlePatches(), c.sweepTokens()))
@@ -446,11 +468,44 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
         _expectPatchRevert(_one(_call(address(venue), hex"12345678")), _patch(0, 0, address(usdg)));
     }
 
-    function test_init_refusesTwoPatchesOnOneCall() public {
+    /// @notice One patch per word: a second patch on a word already patched is refused, scaled or not.
+    function test_init_refusesTwoPatchesOnOneWord() public {
         GenericCallStrategy.BalancePatch[] memory p = new GenericCallStrategy.BalancePatch[](2);
-        p[0] = GenericCallStrategy.BalancePatch({callIndex: 0, wordIndex: 1, token: address(usdg)});
-        p[1] = GenericCallStrategy.BalancePatch({callIndex: 0, wordIndex: 0, token: address(usdg)});
+        p[0] = _scaled(0, 1, address(usdg), 0, 0);
+        p[1] = _scaled(0, 1, address(usdg), 0, 0);
         _expectPatchRevert(_withdrawLeg(PULL), p);
+        p = new GenericCallStrategy.BalancePatch[](3);
+        p[0] = _scaled(0, 1, address(usdg), 0, 0);
+        p[1] = _scaled(0, 0, address(usdg), 0, 0);
+        p[2] = _scaled(0, 1, address(usdg), 1, 2);
+        _expectPatchRevert(_withdrawLeg(PULL), p);
+    }
+
+    /// @notice A scale is both set or both zero: a numerator without a denominator, or the reverse, is refused.
+    function test_init_refusesHalfSetScale() public {
+        GenericCallStrategy.BalancePatch[] memory p = new GenericCallStrategy.BalancePatch[](1);
+        p[0] = _scaled(0, 1, address(usdg), 1, 0);
+        _expectPatchRevert(_withdrawLeg(PULL), p);
+        p[0] = _scaled(0, 1, address(usdg), 0, 1);
+        _expectPatchRevert(_withdrawLeg(PULL), p);
+    }
+
+    /// @notice At most `MAX_SETTLE_PATCHES` patches; 32 on distinct words of one call are accepted.
+    function test_init_capsPatches() public {
+        BatchExecutorLib.Call[] memory s =
+            _one(_call(address(venue), abi.encodePacked(bytes4(0x12345678), new bytes(33 * 32))));
+        GenericCallStrategy.BalancePatch[] memory p = new GenericCallStrategy.BalancePatch[](33);
+        for (uint256 w; w < p.length; ++w) {
+            p[w] = _scaled(0, w, address(usdg), 0, 0);
+        }
+        GenericCallStrategy c = _clone();
+        bytes memory data = abi.encode(PULL, _none(), s, p, _noSweep());
+        vm.expectRevert(GenericCallStrategy.TooManyPatches.selector);
+        c.initialize(address(vault), proposer, data);
+        assembly ("memory-safe") {
+            mstore(p, 32)
+        }
+        _initP(PULL, _none(), s, p, _noSweep());
     }
 
     /// @notice The patch token must already be in the plan: the asset, a leg target or a sweep token.
@@ -819,6 +874,69 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
         _settle(c);
         assertEq(stock.balanceOf(address(c)), 0, "position fully sold");
         assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS - PULL + (bought * 73e6) / 1e18);
+    }
+
+    /// @dev Buy STOCK at 1 USDG = 0.0137 STOCK; sell it back at settle through `swapMin`, the amount
+    ///      patched with the live balance and the minimum patched at 72.27 USDG per STOCK, 99% of 73.
+    function _scaledSellPlan(ERC20Mock stock, MockRateSwap swap) internal returns (GenericCallStrategy) {
+        BatchExecutorLib.Call[] memory e = _two(
+            _call(address(usdg), abi.encodeCall(IERC20.approve, (address(swap), PULL))),
+            _call(address(swap), abi.encodeCall(MockRateSwap.swap, (address(usdg), address(stock), PULL)))
+        );
+        BatchExecutorLib.Call[] memory s = _two(
+            _call(address(stock), abi.encodeCall(IERC20.approve, (address(swap), type(uint256).max))),
+            _call(address(swap), abi.encodeCall(MockRateSwap.swapMin, (address(stock), address(usdg), 0, 0)))
+        );
+        GenericCallStrategy.BalancePatch[] memory p = new GenericCallStrategy.BalancePatch[](2);
+        p[0] = _scaled(1, 2, address(stock), 0, 0);
+        p[1] = _scaled(1, 3, address(stock), 72.27e6, 1e18);
+        swap.setRate(address(usdg), address(stock), 0.0137e30);
+        swap.setRate(address(stock), address(usdg), 73e6);
+        return _initP(PULL, e, s, p, _noSweep());
+    }
+
+    /// @notice A scaled patch writes a minimum proportional to the balance sold: with the price
+    ///         unchanged the floor holds and the whole position sells.
+    function test_settle_scaledMinOutHolds() public {
+        ERC20Mock stock = new ERC20Mock("STOCK", "STK", 18);
+        MockRateSwap swap = new MockRateSwap();
+        GenericCallStrategy c = _scaledSellPlan(stock, swap);
+        _execute(c, PULL);
+        uint256 bought = stock.balanceOf(address(c));
+        assertEq(bought, 13.7e18);
+
+        // 13.7 STOCK at 72.27 USDG each: the minimum written into word 3.
+        uint256 floor = 990.099e6;
+        vm.expectCall(
+            address(swap), abi.encodeCall(MockRateSwap.swapMin, (address(stock), address(usdg), bought, floor))
+        );
+        _settle(c);
+        assertEq(stock.balanceOf(address(c)), 0, "position fully sold");
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS - PULL + 1_000.1e6);
+        assertEq(uint256(c.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    /// @notice When the price falls below the floor between execute and settle, the scaled minimum
+    ///         makes the sell revert instead of filling at any price.
+    function test_settle_scaledMinOutRevertsWhenThePoolMoves() public {
+        ERC20Mock stock = new ERC20Mock("STOCK", "STK", 18);
+        MockRateSwap swap = new MockRateSwap();
+        GenericCallStrategy c = _scaledSellPlan(stock, swap);
+        _execute(c, PULL);
+        swap.setRate(address(stock), address(usdg), 70e6);
+
+        vm.prank(address(vault));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GenericCallStrategy.CallFailed.selector,
+                uint8(1),
+                1,
+                abi.encodeWithSelector(MockRateSwap.TooLittleReceived.selector, 959e6, 990.099e6)
+            )
+        );
+        c.settle();
+        assertEq(stock.balanceOf(address(c)), 13.7e18, "nothing sold");
+        assertEq(uint256(c.state()), uint256(BaseStrategy.State.Executed));
     }
 
     /// @notice An unpatched settle call runs with the calldata fixed at init.

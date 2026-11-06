@@ -244,15 +244,26 @@ contract GCVaultStub {
 
 /// @notice Swap at a settable rate (`out = in * rate / 1e18`), minting the output token.
 contract MockRateSwap {
+    error TooLittleReceived(uint256 out, uint256 minOut);
+
     mapping(address tokenIn => mapping(address tokenOut => uint256)) public rate;
 
     function setRate(address tokenIn, address tokenOut, uint256 r) external {
         rate[tokenIn][tokenOut] = r;
     }
 
-    function swap(address tokenIn, address tokenOut, uint256 amountIn) external returns (uint256 out) {
+    function swap(address tokenIn, address tokenOut, uint256 amountIn) public returns (uint256 out) {
         IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
         out = (amountIn * rate[tokenIn][tokenOut]) / 1e18;
         ERC20Mock(tokenOut).mint(msg.sender, out);
+    }
+
+    /// @notice `swap` with a router-style minimum out.
+    function swapMin(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut)
+        external
+        returns (uint256 out)
+    {
+        out = swap(tokenIn, tokenOut, amountIn);
+        if (out < minOut) revert TooLittleReceived(out, minOut);
     }
 }

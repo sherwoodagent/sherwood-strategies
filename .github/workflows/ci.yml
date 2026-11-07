@@ -19,7 +19,12 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
       - run: forge --version
       - run: forge fmt --check
-      - run: forge build --sizes
+      # Sizes of deployables only. The generic-call lifecycle suite compiles the
+      # protocol's SyndicateGovernor and SyndicateVault, which deploy under
+      # Robinhood's 98,304-byte limit but exceed EIP-170's 24,576, the limit
+      # --sizes enforces. sherwood-protocol's CI skips test files for the same
+      # reason. `forge test` below still compiles and runs every suite.
+      - run: forge build --sizes --skip test
       # Fork suites are named `*Fork` and run in their own job.
       - run: forge test --no-match-contract Fork -vvv
 

@@ -1044,6 +1044,21 @@ contract LaunchpadStrategyTest is Test {
         assertEq(IERC20(token).balanceOf(address(vault)), left, "the queue's slice reached the vault");
     }
 
+    /// @notice `claimable` reads zero for the queue, which `claimFor` refuses.
+    function test_claimable_withdrawalQueueReadsZero() public {
+        address queue = makeAddr("withdrawalQueue");
+        vault.setWithdrawalQueue(queue);
+        vault.setVotes(alice, 60e18);
+        vault.setVotes(queue, 40e18);
+
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        vm.warp(block.timestamp + 1);
+
+        assertEq(s.claimable(queue), 0, "the queue has nothing it can claim");
+        assertGt(s.claimable(alice), 0, "a holder still reads its slice");
+    }
+
     /// @dev The fee token IS the quote: already held after the quote leg, so no
     ///      second swap, and the approval covers `quoteIn + feeAmount`.
     function test_execute_feeInQuoteToken_needsNoSecondSwap() public {
